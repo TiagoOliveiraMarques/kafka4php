@@ -1,0 +1,13 @@
+[package]
+name = "k4p-php"
+description = "PHP thread pool implementing the k4p-core Executor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+k4p-core.workspace = true
+
+[lints]
+workspace = true

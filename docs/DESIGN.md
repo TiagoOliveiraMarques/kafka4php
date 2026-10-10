@@ -193,6 +193,22 @@ pub trait Executor: Send + Sync + 'static {
 }
 ```
 
+Implementation notes (`crates/k4p-core`):
+
+- All types derive `Debug, Clone, PartialEq, Eq`. `ExecutionError` implements
+  `std::error::Error`; its `Display` string (e.g. `uncaught exception
+  RuntimeException: db down`) is used as the retry reason.
+- `BoxFuture<'a, T>` is defined in `k4p-core` itself
+  (`Pin<Box<dyn Future<Output = T> + Send + 'a>>`, same shape as `futures`'),
+  so the crate has no runtime dependencies.
+- `Executor` is implemented for `Arc<E>` (including `Arc<dyn Executor>`).
+- Feature `testing` (test-only, pulls in `tokio` for timers) provides
+  `k4p_core::testing::FakeExecutor`: outcomes scripted per record
+  (`delivery_topic`, `partition`, `offset`), by closure, or a default; optional
+  per-message delay; records received messages in call order; reports a fixed
+  `capacity` and tracks current / maximum in-flight executions. Also
+  `testing::inbound(topic, partition, offset)` to build test messages.
+
 **Mapping `ExecutionError` → action (host policy, v1):** every `ExecutionError` is
 treated as `RetryLater { reason: <error description> }`. A message that repeatedly
 crashes or times out therefore reaches `max_attempts` and lands in the DLQ with

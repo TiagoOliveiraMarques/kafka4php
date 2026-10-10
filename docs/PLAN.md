@@ -25,7 +25,7 @@ build in which order**; DESIGN.md says **how the system works**.
 
 | Step | Title | Depends on | Status | Owner |
 |---|---|---|---|---|
-| S0 | Workspace scaffold + `k4p-core` contract | — | todo | |
+| S0 | Workspace scaffold + `k4p-core` contract | — | done | Claude Code (Opus 5.5), 2026-10-10 |
 | S1 | Toolchain Docker image (ZTS + embed PHP, Rust) | — | todo | |
 | S2 | C SAPI, single thread (`k4p-php-sys`) | S0, S1 | todo | |
 | S3 | PHP thread pool + timeouts + recycling (`k4p-php`) | S2 | todo | |
@@ -82,7 +82,33 @@ contract (DESIGN.md §4) implemented in `k4p-core`, so S2/S5/S6 can start in par
 - `cargo clippy --workspace --all-targets -- -D warnings` clean.
 - `FakeExecutor` has tests for scripted outcomes, delays and the capacity value.
 
-**Handoff notes:** _(fill in when done)_
+**Handoff notes:**
+- **Built:** Cargo workspace (`Cargo.toml`, resolver 3, edition 2024) with crates
+  `k4p-core`, `k4p-php-sys`, `k4p-php`, `k4p-host`, `kafka4php` (bin). Non-core
+  crates are stubs; `k4p-php`, `k4p-host`, `kafka4php` already depend on `k4p-core`
+  (`k4p-php-sys` depends on nothing). Shared deps go in `[workspace.dependencies]`
+  (`k4p-core`, `tokio` with `default-features = false` — add features per crate).
+- **Toolchain:** `rust-toolchain.toml` pins **1.99.0** (+ rustfmt, clippy). S1:
+  install that toolchain in the dev image. Lints in `[workspace.lints]`; every crate
+  has `[lints] workspace = true`. `rustfmt.toml` sets `max_width = 100`, LF.
+- **Contract:** `crates/k4p-core/src/lib.rs`, exactly DESIGN.md §4. Deviations
+  (documented in §4): `BoxFuture` is our own alias, not `futures`'; extra
+  `impl Executor for Arc<E>`; all types also derive `Eq`.
+- **FakeExecutor:** `crates/k4p-core/src/testing.rs`, feature `testing`. Use as a
+  dev-dependency: `k4p-core = { workspace = true, features = ["testing"] }`.
+  Builder: `FakeExecutor::new(capacity).with_default(..).with_outcome_fn(..)
+  .with_delay(..)` / `.with_delay_fn(..)`; builders panic if the fake was already
+  cloned. `on_record(delivery_topic, partition, offset, outcome)` works at any time.
+  Inspection: `received()`, `received_ids()`, `in_flight()`, `max_in_flight()` (S6:
+  assert `max_in_flight() <= capacity()`). Messages are recorded and counted in
+  flight when `execute` is **called**, not when first polled. Delays use
+  `tokio::time::sleep` — callers need a tokio runtime with time enabled;
+  `start_paused = true` tests work.
+- **Verified** in `rust:1-bookworm` (S1 not done): `cargo fmt --check`,
+  `cargo build --workspace`, `cargo test --workspace --all-features` (12 tests),
+  `cargo clippy --workspace --all-targets [--all-features] -- -D warnings`.
+- **Repo:** git initialised here (branch `main`, work on `s0-workspace-scaffold`);
+  `.gitattributes` forces LF. `core.autocrlf=false` set locally.
 
 **Notes from other steps:** _(none yet)_
 
