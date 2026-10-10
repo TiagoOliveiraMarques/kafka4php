@@ -166,13 +166,13 @@ cargo inside it from a Windows host.
   has to come from a separate, test-only Dockerfile, or the check is documented
   as infeasible (as the S2 criteria allow).
   Headers: `php-config --includes`; `sapi/embed/php_embed.h` is installed.
-- **CI:** `.github/workflows/dev-image.yml` builds the image for PHP 8.4 and 8.5 on
+- **CI:** `.github/workflows/build.yml` builds the image for PHP 8.4 and 8.5 on
   every PR and push to `main` (GitHub Actions cache per version). It's green iff the
   image builds, including the PHP checks. The full `scripts/ci.sh` is S9.
 - **Files:** `docker/dev.Dockerfile` (+ `dev.Dockerfile.dockerignore`: the build
   context is only `rust-toolchain.toml` and `docker/php-check.sh`), `docker/php-check.sh`,
   `docker/compose.test.yml`, `scripts/dev.sh`, `scripts/dev.ps1`, `scripts/kafka-check.sh`,
-  `.github/workflows/dev-image.yml`.
+  `.github/workflows/build.yml`.
 - **Image contents:** Rust 1.99.0 from `rust-toolchain.toml` (+ clippy, rustfmt) in
   `/usr/local/{rustup,cargo}`; clang 14 / libclang-dev, cmake 3.25, pkg-config,
   OpenSSL 3.0, zstd 1.5.4, SASL 2.1.28 headers, git, unzip, Composer 2.10.3. It runs

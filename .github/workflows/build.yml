@@ -1,7 +1,7 @@
 # Builds the toolchain image (docker/dev.Dockerfile) for every supported PHP version.
 # Green iff the image builds, which includes docker/php-check.sh verifying that the
 # base image's PHP is ZTS + embed + max execution timers + OPcache.
-name: dev-image
+name: build
 
 on:
   push:
