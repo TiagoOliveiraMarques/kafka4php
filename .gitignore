@@ -1,0 +1,7 @@
+/target/
+**/target/
+php/vendor/
+.idea/
+.vscode/
+*.swp
+.DS_Store
