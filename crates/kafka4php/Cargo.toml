@@ -1,0 +1,13 @@
+[package]
+name = "kafka4php"
+description = "kafka4php binary: config, CLI, logging, signals, health and wiring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+k4p-core.workspace = true
+
+[lints]
+workspace = true

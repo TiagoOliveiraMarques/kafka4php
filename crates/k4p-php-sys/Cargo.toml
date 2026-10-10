@@ -1,0 +1,13 @@
+[package]
+name = "k4p-php-sys"
+description = "C SAPI embedding PHP (ZTS) and raw FFI bindings for kafka4php"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+
+
+[lints]
+workspace = true
