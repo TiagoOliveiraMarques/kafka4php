@@ -158,19 +158,21 @@ cargo inside it from a Windows host.
 **Handoff notes:**
 - **Deviation (documented in DESIGN.md §8):** the official `php:8.4/8.5-zts-bookworm`
   images (8.4.26 / 8.5.11 at the time) **already** ship `--enable-embed --enable-zts`,
-  `libphp.so`, Zend max execution timers (on by default with ZTS) and OPcache. So
-  `docker/php-rebuild.sh` verifies those and only rebuilds PHP from the image's own
-  source when one is missing. The rebuild path was tested with
-  `--build-arg FORCE_PHP_REBUILD=1` on 8.4: it took about 3 min, produced a freshly built
-  libphp with all checks passing, and `pecl` and `docker-php-ext-install pdo_mysql` still work.
-- **S2:** for the leak check, `--build-arg PHP_EXTRA_CONFIGURE_ARGS=--enable-debug`
-  should give a ZTS debug build (implies a rebuild; untested with `--enable-debug`
-  specifically, but it is the same code path). Use a separate tag, e.g.
-  `docker build -f docker/dev.Dockerfile --build-arg PHP_EXTRA_CONFIGURE_ARGS=--enable-debug -t kafka4php-dev:php8.4-debug .`
+  `libphp.so`, Zend max execution timers (on by default with ZTS) and OPcache. So PHP
+  is **not rebuilt**: `docker/php-check.sh` verifies those and fails the image build
+  if any is missing (review decision on PR #2: fail loudly rather than diverge from
+  the base image).
+- **S2:** the dev image has no debug PHP. A ZTS debug build for the leak check
+  has to come from a separate, test-only Dockerfile, or the check is documented
+  as infeasible (as the S2 criteria allow).
   Headers: `php-config --includes`; `sapi/embed/php_embed.h` is installed.
+- **CI:** `.github/workflows/dev-image.yml` builds the image for PHP 8.4 and 8.5 on
+  every PR and push to `main` (GitHub Actions cache per version). It's green iff the
+  image builds, including the PHP checks. The full `scripts/ci.sh` is S9.
 - **Files:** `docker/dev.Dockerfile` (+ `dev.Dockerfile.dockerignore`: the build
-  context is only `rust-toolchain.toml` and `docker/php-rebuild.sh`), `docker/php-rebuild.sh`,
-  `docker/compose.test.yml`, `scripts/dev.sh`, `scripts/dev.ps1`, `scripts/kafka-check.sh`.
+  context is only `rust-toolchain.toml` and `docker/php-check.sh`), `docker/php-check.sh`,
+  `docker/compose.test.yml`, `scripts/dev.sh`, `scripts/dev.ps1`, `scripts/kafka-check.sh`,
+  `.github/workflows/dev-image.yml`.
 - **Image contents:** Rust 1.99.0 from `rust-toolchain.toml` (+ clippy, rustfmt) in
   `/usr/local/{rustup,cargo}`; clang 14 / libclang-dev, cmake 3.25, pkg-config,
   OpenSSL 3.0, zstd 1.5.4, SASL 2.1.28 headers, git, unzip, Composer 2.10.3. It runs

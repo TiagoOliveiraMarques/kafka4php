@@ -11,6 +11,11 @@ FROM composer:2.10.3 AS composer
 
 FROM php:${PHP_VERSION}-zts-bookworm
 
+# PHP must be ZTS with the embed SAPI (libphp.so), per-thread execution timers and
+# OPcache. The official ZTS images provide all of it; fail the build if they don't.
+COPY docker/php-check.sh /usr/local/bin/k4p-php-check
+RUN k4p-php-check
+
 # Native toolchain: C for the SAPI (cc crate), clang for bindgen, cmake + headers for
 # librdkafka (rust-rdkafka cmake-build, ssl, zstd, sasl).
 RUN set -eux; \
@@ -27,16 +32,6 @@ RUN set -eux; \
         unzip \
     ; \
     rm -rf /var/lib/apt/lists/*
-
-# PHP must be ZTS with the embed SAPI (libphp.so) and per-thread execution timers.
-# Recent official ZTS images already are; php-rebuild.sh verifies that and otherwise
-# rebuilds PHP from the image's own source with its original configure flags.
-# FORCE_PHP_REBUILD=1 rebuilds unconditionally; PHP_EXTRA_CONFIGURE_ARGS (e.g.
-# "--enable-debug") are appended to configure and imply a rebuild.
-ARG FORCE_PHP_REBUILD=0
-ARG PHP_EXTRA_CONFIGURE_ARGS=""
-COPY docker/php-rebuild.sh /usr/local/bin/k4p-php-rebuild
-RUN k4p-php-rebuild
 
 COPY --from=composer /usr/bin/composer /usr/local/bin/composer
 

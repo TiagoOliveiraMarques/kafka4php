@@ -565,15 +565,11 @@ logged with `source=php`.
 
 - **Toolchain image** (`docker/dev.Dockerfile`, `ARG PHP_VERSION`, default 8.4):
   based on `php:<ver>-zts-bookworm`. PHP must be ZTS + embed (`libphp.so`) + Zend
-  max execution timers, with OPcache loaded. Current official ZTS images already
-  ship exactly that (`--enable-embed --enable-zts`; timers default on with ZTS), so
-  `docker/php-rebuild.sh` **verifies** it and only rebuilds PHP from the image's
-  own source (`docker-php-source`, original `php-config --configure-options` plus
-  `--enable-zts --enable-embed --enable-zend-max-execution-timers`, installed into
-  `/usr/local` so `php-config`, `docker-php-ext-install` and `pecl` keep working)
-  when something is missing. Build args: `FORCE_PHP_REBUILD=1`;
-  `PHP_EXTRA_CONFIGURE_ARGS` (appended to configure, implies a rebuild — e.g. a
-  debug build). Plus the Rust toolchain pinned by `rust-toolchain.toml`, cmake,
+  max execution timers, with OPcache loaded. The official ZTS images ship exactly
+  that (`--enable-embed --enable-zts`; timers default on with ZTS), so PHP is used
+  **as is** — never rebuilt. `docker/php-check.sh` runs first and **fails the
+  build** if any of these is missing. Plus the Rust toolchain pinned by
+  `rust-toolchain.toml`, cmake,
   clang/libclang (bindgen), pkg-config, OpenSSL/zstd/SASL headers, Composer.
   All builds and tests run inside it via `scripts/dev.sh` (Git Bash/Linux) or
   `scripts/dev.ps1` (PowerShell): repo mounted at `/work`, cargo registry/git in
