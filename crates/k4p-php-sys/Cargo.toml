@@ -5,9 +5,32 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish = false
+links = "php"
 
 [dependencies]
+k4p-core.workspace = true
 
+[dev-dependencies]
+serde_json = "1"
+
+[build-dependencies]
+bindgen = { version = "0.72", default-features = false, features = ["runtime"] }
+cc = "1"
+
+# Each integration test binary owns its process: it initializes the PHP runtime once
+# on the main thread and runs its cases sequentially on one PHP worker thread (see
+# tests/common/mod.rs), so it uses its own harness instead of libtest's.
+[[test]]
+name = "sapi"
+harness = false
+
+[[test]]
+name = "memory"
+harness = false
+
+[[test]]
+name = "leaks"
+harness = false
 
 [lints]
 workspace = true
