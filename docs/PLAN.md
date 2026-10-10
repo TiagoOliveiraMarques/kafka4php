@@ -26,7 +26,7 @@ build in which order**; DESIGN.md says **how the system works**.
 | Step | Title | Depends on | Status | Owner |
 |---|---|---|---|---|
 | S0 | Workspace scaffold + `k4p-core` contract | — | done | Claude Code (Opus 5.5), 2026-10-10 |
-| S1 | Toolchain Docker image (ZTS + embed PHP, Rust) | — | todo | |
+| S1 | Toolchain Docker image (ZTS + embed PHP, Rust) | — | done | Claude Code (Opus 5.5), 2026-10-10 |
 | S2 | C SAPI, single thread (`k4p-php-sys`) | S0, S1 | todo | |
 | S3 | PHP thread pool + timeouts + recycling (`k4p-php`) | S2 | todo | |
 | S4 | Opcache, preload & per-request cost under ZTS | S2 | todo | |
@@ -155,7 +155,48 @@ cargo inside it from a Windows host.
   check command).
 - Both `PHP_VERSION=8.4` and `8.5` build.
 
-**Handoff notes:** _(fill in when done)_
+**Handoff notes:**
+- **Deviation (documented in DESIGN.md §8):** the official `php:8.4/8.5-zts-bookworm`
+  images (8.4.26 / 8.5.11 at the time) **already** ship `--enable-embed --enable-zts`,
+  `libphp.so`, Zend max execution timers (on by default with ZTS) and OPcache. So PHP
+  is **not rebuilt**: `docker/php-check.sh` verifies those and fails the image build
+  if any is missing (review decision on PR #2: fail loudly rather than diverge from
+  the base image).
+- **S2:** the dev image has no debug PHP. A ZTS debug build for the leak check
+  has to come from a separate, test-only Dockerfile, or the check is documented
+  as infeasible (as the S2 criteria allow).
+  Headers: `php-config --includes`; `sapi/embed/php_embed.h` is installed.
+- **CI:** `.github/workflows/build.yml` builds the image for PHP 8.4 and 8.5 on
+  every PR and push to `main` (GitHub Actions cache per version). It's green iff the
+  image builds, including the PHP checks. The full `scripts/ci.sh` is S9.
+- **Files:** `docker/dev.Dockerfile` (+ `dev.Dockerfile.dockerignore`: the build
+  context is only `rust-toolchain.toml` and `docker/php-check.sh`), `docker/php-check.sh`,
+  `docker/compose.test.yml`, `scripts/dev.sh`, `scripts/dev.ps1`, `scripts/kafka-check.sh`,
+  `.github/workflows/build.yml`.
+- **Image contents:** Rust 1.99.0 from `rust-toolchain.toml` (+ clippy, rustfmt) in
+  `/usr/local/{rustup,cargo}`; clang 14 / libclang-dev, cmake 3.25, pkg-config,
+  OpenSSL 3.0, zstd 1.5.4, SASL 2.1.28 headers, git, unzip, Composer 2.10.3. It runs
+  as root. Image size is about 2.4 GB for each of 8.4 and 8.5.
+- **Running things:** `scripts/dev.sh <cmd>` (Git Bash/Linux) or `scripts\dev.ps1 <cmd>`.
+  `PHP_VERSION=8.5` selects the image. `target/` is a per-PHP-version named volume
+  (`k4p-target-php8.4`), so the host `target/` stays empty. The image is rebuilt (cached)
+  on each call. TTY is auto-detected; override it with `K4P_TTY=0|1`. Gotcha: Windows
+  PowerShell 5.1 strips embedded `"` from native-command arguments, so pass complex
+  `bash -c '...'` commands from Git Bash.
+- **Kafka:** `apache/kafka:4.3.1` (KRaft, single node), network `kafka4php-test`,
+  `kafka:9092` (in network) / `localhost:19092` (host), **auto topic creation off**,
+  group initial rebalance delay 0. `scripts/dev.sh --with-kafka <cmd>` starts it,
+  waits for it to be healthy and sets `K4P_KAFKA_BOOTSTRAP=kafka:9092`. Check command:
+  `docker compose -f docker/compose.test.yml up -d --wait && scripts/kafka-check.sh`
+  (creates a 3-partition topic, then produces and consumes 3 records from a separate container
+  on the network). Stop with `docker compose -f docker/compose.test.yml down -v`.
+- **Verified:** on 8.4 and 8.5, `php -v` shows ZTS, the SAPIs include `embed`, `libphp.so`
+  exists, the timers are enabled, `Zend OPcache` is loaded, `docker-php-ext-install pdo_mysql`
+  works, and `cargo build --workspace` passes in the image (8.4 also passes `cargo test`).
+  `scripts/dev.sh cargo --version` (Git Bash) and `scripts\dev.ps1 cargo --version`
+  (PowerShell) work. The dev container reaches `kafka:9092` via `--with-kafka`, and
+  `kafka-check.sh` reports OK.
+- Only amd64 was verified; arm64 is for S9 (buildx).
 
 **Notes from other steps:** _(none yet)_
 

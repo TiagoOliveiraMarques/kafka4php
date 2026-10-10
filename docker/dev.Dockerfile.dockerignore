@@ -1,0 +1,4 @@
+# Build context for dev.Dockerfile: only what the image needs.
+*
+!rust-toolchain.toml
+!docker/php-check.sh

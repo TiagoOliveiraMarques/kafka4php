@@ -563,11 +563,24 @@ logged with `source=php`.
 
 ## 8. Build & distribution
 
-- **Toolchain image** (`docker/dev.Dockerfile`): based on `php:<ver>-zts-bookworm`,
-  PHP rebuilt from the matching source with `--enable-zts --enable-embed
-  --enable-zend-max-execution-timers` (installed into `/usr/local` so
-  `php-config`, `docker-php-ext-install` and `pecl` keep working), plus the Rust
-  toolchain, cmake, clang (for bindgen). All builds and tests run inside it.
+- **Toolchain image** (`docker/dev.Dockerfile`, `ARG PHP_VERSION`, default 8.4):
+  based on `php:<ver>-zts-bookworm`. PHP must be ZTS + embed (`libphp.so`) + Zend
+  max execution timers, with OPcache loaded. The official ZTS images ship exactly
+  that (`--enable-embed --enable-zts`; timers default on with ZTS), so PHP is used
+  **as is** — never rebuilt. `docker/php-check.sh` runs first and **fails the
+  build** if any of these is missing. Plus the Rust toolchain pinned by
+  `rust-toolchain.toml`, cmake,
+  clang/libclang (bindgen), pkg-config, OpenSSL/zstd/SASL headers, Composer.
+  All builds and tests run inside it via `scripts/dev.sh` (Git Bash/Linux) or
+  `scripts/dev.ps1` (PowerShell): repo mounted at `/work`, cargo registry/git in
+  named volumes, `target/` in a named volume per PHP version
+  (`k4p-target-php<ver>`), env `PHP_VERSION` selects the image.
+- **Test Kafka** (`docker/compose.test.yml`): single-node KRaft `apache/kafka`
+  (pinned), network `kafka4php-test`, broker `kafka:9092` inside the network and
+  `localhost:19092` from the host, topic auto-creation **off**.
+  `scripts/dev.sh --with-kafka …` starts it, waits for health and attaches the
+  container (env `K4P_KAFKA_BOOTSTRAP=kafka:9092`). `scripts/kafka-check.sh`
+  smoke-tests it (create topic, produce, consume).
 - **`k4p-php-sys` build.rs**: runs `php-config --includes --prefix --libs`, compiles
   `csrc/*.c` with the `cc` crate, links `libphp` dynamically, bindgens only
   `csrc/k4p_sapi.h`.
