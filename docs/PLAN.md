@@ -25,7 +25,7 @@ build in which order**; DESIGN.md says **how the system works**.
 
 | Step | Title | Depends on | Status | Owner |
 |---|---|---|---|---|
-| S0 | Workspace scaffold + `k4p-core` contract | — | todo | |
+| S0 | Workspace scaffold + `k4p-core` contract | — | in-progress | Claude Code (Opus 5.5), 2026-10-10 |
 | S1 | Toolchain Docker image (ZTS + embed PHP, Rust) | — | todo | |
 | S2 | C SAPI, single thread (`k4p-php-sys`) | S0, S1 | todo | |
 | S3 | PHP thread pool + timeouts + recycling (`k4p-php`) | S2 | todo | |
