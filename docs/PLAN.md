@@ -27,7 +27,7 @@ build in which order**; DESIGN.md says **how the system works**.
 |---|---|---|---|---|
 | S0 | Workspace scaffold + `k4p-core` contract | — | done | Claude Code (Opus 5.5), 2026-10-10 |
 | S1 | Toolchain Docker image (ZTS + embed PHP, Rust) | — | done | Claude Code (Opus 5.5), 2026-10-10 |
-| S2 | C SAPI, single thread (`k4p-php-sys`) | S0, S1 | todo | |
+| S2 | C SAPI, single thread (`k4p-php-sys`) | S0, S1 | in-progress | Claude Code sub-agent (Opus 5.5), 2026-10-10 |
 | S3 | PHP thread pool + timeouts + recycling (`k4p-php`) | S2 | todo | |
 | S4 | Opcache, preload & per-request cost under ZTS | S2 | todo | |
 | S5 | PHP userland framework (`php/`) | S0 | todo | |
