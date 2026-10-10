@@ -341,10 +341,14 @@ SAPI module properties:
 - **name:** `"kafka4php"` (this is `PHP_SAPI`). Some libraries branch on
   `PHP_SAPI === 'cli'`; this is documented user-facing. Opcache reads
   `opcache.enable` (not `opcache.enable_cli`) for non-cli SAPIs.
-  **Known gap (open, S4):** PHP 8.4's OPcache only activates for a hard-coded list
-  of SAPI names (`accel_find_sapi()`: apache2handler, fpm-fcgi, frankenphp, …), so
-  under `kafka4php` it is loaded but inactive on 8.4 (`opcache_get_status()` returns
-  false). PHP 8.5 dropped that list and OPcache works. See PLAN.md S4 notes.
+  **Limitation: no OPcache on PHP 8.4 (accepted, by decision).** PHP 8.4's OPcache
+  only activates for a hard-coded list of SAPI names (`accel_find_sapi()`:
+  apache2handler, fpm-fcgi, frankenphp, …), so under `kafka4php` it is loaded but
+  inactive (`opcache_get_status()` returns false): every message recompiles the
+  scripts it runs, and `opcache.preload` / the JIT are unavailable. We do **not**
+  work around it (e.g. by presenting another SAPI name to OPcache). PHP 8.5 dropped
+  the list, so OPcache, preload and the JIT work there. Users who need OPcache run
+  the PHP 8.5 image; this is documented user-facing.
 - **ub_write** (output: `echo`, `print`, `var_dump`): forwarded to the host log at
   `info` with `stream=stdout` (log callback source `stdout`, line by line, §5.1.1).
   Never part of the result.
@@ -744,7 +748,7 @@ logged with `source=php`.
   COPY kafka4php.toml /etc/kafka4php/kafka4php.toml
   ```
 
-- Supported PHP: 8.4 and 8.5 (CI matrix). Linux amd64 + arm64.
+- Supported PHP: 8.4 and 8.5 (CI matrix); 8.4 runs without OPcache (§5.1). Linux amd64 + arm64.
 
 ---
 

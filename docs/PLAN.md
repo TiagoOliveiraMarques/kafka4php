@@ -286,8 +286,9 @@ outcome classification and no per-request memory growth. Highest-risk step.
     has `SCRIPT_FILENAME`/`SCRIPT_NAME`/`PHP_SELF`/`PATH_TRANSLATED`.
   - §8 build.rs: `php-config --includes --prefix` only (no `--libs`), `$PHP_CONFIG`,
     `links = "php"`, no rpath (ld cache). §9: fixture path and leak check.
-  - §5.1: **known gap, PHP 8.4 OPcache is inactive under SAPI name `kafka4php`** —
-    see S4's notes (handed to S4; S2's criteria don't depend on OPcache).
+  - §5.1: **PHP 8.4 OPcache is inactive under SAPI name `kafka4php`.** Reviewed
+    and accepted as a limitation: no OPcache on 8.4, OPcache on 8.5, no workaround
+    (see S4's notes).
 - **Gotchas for S3:** see S3's *Notes from other steps*. Also: PHP can't be
   restarted in a process, so every test binary that runs PHP must be its own
   process with `harness = false` (`tests/common/mod.rs` is a reusable runner).
@@ -295,7 +296,7 @@ outcome classification and no per-request memory growth. Highest-risk step.
   messages itself, but don't: it is also the thread that must call
   `runtime_shutdown`. Rust's runtime already ignores `SIGPIPE`; the SAPI doesn't
   touch signal dispositions (no `signal(SIGPIPE, SIG_IGN)` like embed does).
-- **Gotchas for S4:** see S4's notes: OPcache on 8.4; benchmark outside the `/work`
+- **Gotchas for S4:** see S4's notes: no OPcache on 8.4 (accepted limitation); benchmark outside the `/work`
   bind mount (an empty request costs ~0.05 ms from `/tmp`, ~5 ms from `/work` on
   Docker Desktop for Windows); `opcache.file_update_protection`.
 - **Acceptance evidence** (both PHP 8.4.26 and 8.5.11, toolchain image):
@@ -413,8 +414,9 @@ under ZTS, establish the default INI, and measure per-request overhead so we can
 make honest throughput claims.
 
 **Tasks**
-- Verify opcache is active for SAPI `kafka4php` (`opcache_get_status()` from a
-  fixture; hits increase across requests).
+- Verify opcache is active for SAPI `kafka4php` on PHP 8.5 (`opcache_get_status()`
+  from a fixture; hits increase across requests), and inactive on PHP 8.4 (accepted
+  limitation, DESIGN.md §5.1). Preload and JIT work is 8.5-only.
 - Verify `opcache.preload` (+ `opcache.preload_user` if needed) works in the
   embedded ZTS runtime: preloaded class available in requests without autoload.
   Fix the SAPI (in `k4p-php-sys`) if needed — coordinate via S2's notes if S3 is
@@ -446,21 +448,18 @@ make honest throughput claims.
   milliseconds: an empty request took ~5 ms with the entrypoint under `/work` and
   ~0.05 ms (opcache on or off) from a copy in `/tmp`. Copy fixtures to a temp dir as
   `crates/k4p-php-sys/tests/memory.rs` does.
-- From S2, **important:** on **PHP 8.4 OPcache is inactive under our SAPI.**
-  `ext/opcache/ZendAccelerator.c` `accel_find_sapi()` (8.4.26) only enables OPcache
-  for `apache`, `fastcgi`, `cli-server`, `cgi-fcgi`, `fpm-fcgi`, `fpmi-fcgi`,
-  `apache2handler`, `litespeed`, `uwsgi`, `fuzzer`, `frankenphp`, `ngx-php` (and
-  `cli`/`phpdbg` with `enable_cli`). With `sapi_module.name = "kafka4php"` it is
-  loaded (`extension_loaded('Zend OPcache')`) but `opcache_get_status()` returns
-  false. On 8.5 the list is gone: OPcache is active (hits increase per request;
-  verified with a throwaway probe). Possible fix to evaluate: OPcache decides in
-  `accel_startup()`, during `zend_startup_extensions()`, which runs *after*
-  `zend_startup_modules()` (our native module's MINIT) and after the `PHP_SAPI`
-  constant is registered; so the SAPI could present a supported name only for that
-  window (e.g. set `sapi_module.name` in our MINIT, restore it right after
-  `php_module_startup()`), keeping `PHP_SAPI` / `php_sapi_name()` = `kafka4php`.
-  Check what else OPcache keys on the SAPI name before doing that. DESIGN.md §5.1
-  records the gap.
+- From S2, **decided:** on **PHP 8.4 OPcache is inactive under our SAPI, and that
+  is an accepted limitation — do not work around it.** `ext/opcache/ZendAccelerator.c`
+  `accel_find_sapi()` (8.4.26) only enables OPcache for `apache`, `fastcgi`,
+  `cli-server`, `cgi-fcgi`, `fpm-fcgi`, `fpmi-fcgi`, `apache2handler`, `litespeed`,
+  `uwsgi`, `fuzzer`, `frankenphp`, `ngx-php` (and `cli`/`phpdbg` with
+  `enable_cli`). With `sapi_module.name = "kafka4php"` it is loaded
+  (`extension_loaded('Zend OPcache')`) but `opcache_get_status()` returns false. On
+  8.5 the list is gone and OPcache is active (hits increase per request). So for S4:
+  the opcache, preload and JIT tasks and tests apply to **PHP 8.5**. On 8.4, add a
+  test asserting OPcache is *inactive* (so a PHP change is noticed), and benchmark
+  8.4 without OPcache only. The default INI must not break 8.4. DESIGN.md §5.1
+  records the limitation.
 - From S2: on 8.5, `opcache.enable` defaults to 1 for the `kafka4php` SAPI (OPcache
   is built in; 8.4 loads it via `conf.d/docker-php-ext-opcache.ini`). Note
   `opcache.file_update_protection` (2 s): freshly written fixtures are not cached for
@@ -674,7 +673,10 @@ covering DESIGN.md §9's E2E scenarios.
 
 **Handoff notes:** _(fill in when done)_
 
-**Notes from other steps:** _(none yet)_
+**Notes from other steps:**
+- From S2 (decision): no OPcache on PHP 8.4 under SAPI `kafka4php` (DESIGN.md §5.1). The
+  example app's preload script and any OPcache/preload E2E checks only apply to the 8.5
+  image; the 8.4 E2E run must not depend on OPcache.
 
 ---
 
@@ -704,4 +706,8 @@ building it).
 
 **Handoff notes:** _(fill in when done)_
 
-**Notes from other steps:** _(none yet)_
+**Notes from other steps:**
+- From S2 (decision): document in the PHP compatibility page (and the README) that
+  PHP 8.4 runs **without OPcache** (and so without preload / JIT) because PHP 8.4
+  only enables OPcache for a fixed list of SAPI names; PHP 8.5 has full OPcache.
+  Recommend the 8.5 image when performance matters. DESIGN.md §5.1.
