@@ -29,7 +29,7 @@ build in which order**; DESIGN.md says **how the system works**.
 | S1 | Toolchain Docker image (ZTS + embed PHP, Rust) | — | done | Claude Code (Opus 5.5), 2026-10-10 |
 | S2 | C SAPI, single thread (`k4p-php-sys`) | S0, S1 | done | Claude Code sub-agent (Opus 5.5), 2026-10-10 |
 | S3 | PHP thread pool + timeouts + recycling (`k4p-php`) | S2 | done | Claude Code (Opus 5.5), 2026-10-17 |
-| S4 | Opcache, preload & per-request cost under ZTS | S2 | todo | |
+| S4 | Opcache, preload & per-request cost under ZTS | S2 | done | Claude Code (Opus 5.5), 2026-10-17 |
 | S5 | PHP userland framework (`php/`) | S0 | done | Claude Code (Opus 5.5), 2026-10-17 |
 | S6 | Kafka consumer engine + dispatcher (`k4p-host`) | S0, S1 | todo | |
 | S7 | Result actions: produce, retry tiers, DLQ (`k4p-host`) | S6 | todo | |
@@ -473,6 +473,11 @@ and a health signal. DESIGN.md §5.5.
   Soft timeouts use per-thread `SIGRTMIN` timers (`timer_create` with
   `SIGEV_THREAD_ID`): never block `SIGRTMIN` in PHP threads. A soft-timed-out request
   is a normal `Err(SoftTimeout)` and the thread stays usable.
+- From S4: any test asserting on process RSS should first turn transparent huge
+  pages off for its process (`disable_thp()` in `crates/k4p-php-sys/tests/memory.rs`):
+  Docker Desktop's VM has THP `always`, and khugepaged collapsing a 2 MiB Zend MM
+  chunk adds up to 2 MiB of RSS at a random moment. The default INI now lives in
+  the SAPI (DESIGN.md §5.1.2); it changes nothing the pool relies on.
 
 ---
 
@@ -511,7 +516,55 @@ make honest throughput claims.
   DESIGN.md subsection "Performance characteristics".
 - Default INI documented in DESIGN.md.
 
-**Handoff notes:** _(fill in when done)_
+**Handoff notes:**
+- **Built** (all in `crates/k4p-php-sys/`, nothing in `k4p-php`, so no overlap with S3):
+  - **Default INI** in `csrc/k4p_sapi.c` `k4p_sapi_ini_defaults()` (the SAPI's
+    `ini_defaults` hook, lowest precedence): the S2 SAPI defaults plus
+    `memory_limit=128M`, `max_execution_time=30`, `disable_functions=<all 34 pcntl_*>`,
+    `opcache.enable=1`. Everything else is PHP's default; `validate_timestamps=0` is a
+    documented production *recommendation*, not a default (keeps mounted-code
+    development working); the JIT stays off by default. DESIGN.md §5.1.2.
+  - `tests/opcache.rs` (+ `tests/fixtures/opcache/`): 8.5 — OPcache active, hits
+    increase, entry script cached; preloaded class + function visible with a throwing
+    autoloader registered; `opcache.jit=tracing` on, then **100,000 requests on 4
+    threads** at once with per-request result verification, JIT buffer use grows.
+    8.4 — OPcache loaded but `opcache_get_status() === false`, nothing preloaded, the
+    same 4-thread run passes. `K4P_JIT_REQUESTS` overrides the count.
+  - `tests/default_ini.rs` (+ `tests/fixtures/default_ini/`): default values,
+    `ini_file` beats them, `ini_entries` beat both, conf.d still read.
+  - `benches/request_cost.rs` (+ `benches/app/`, a stand-in for the §5.4 framework):
+    `cargo bench -p k4p-php-sys --bench request_cost` re-runs itself per row
+    (PHP starts once per process), 3 runs per row, prints the Markdown table.
+    Needs `composer` (toolchain image) to generate the app's autoloader in a temp copy.
+- **No SAPI fix was needed**: OPcache, preload and the tracing JIT work as is on 8.5.
+- **Benchmark** (one thread; full table, system details and caveats in DESIGN.md
+  §5.7). Recorded run: Ryzen 7 4800HS laptop on AC power, Docker Desktop/WSL2, median
+  of 3 × 50k requests, µs mean per request: `empty` off 20–21 / on 11; `kernel` off
+  ~675–685 (8.4 and 8.5 alike) / on 27; `preload` 21; `validate_timestamps=0` within
+  noise. The same laptop on battery was ~3× slower across the board with wider tails,
+  so DESIGN.md states the stable *ratios*: OPcache ≈ 25× for a typical entrypoint, 2×
+  for an empty one; preload ≈ −25% with ~15 classes. The bench prints the
+  container-side system info (CPU, memory, kernel, THP) above its table.
+- **Fixed a flaky S2 test** (`tests/memory.rs`): on 8.5 it failed once with RSS
+  +5.24% — a single +1.7 MiB step mid-run. Cause: transparent huge pages are `always`
+  in Docker Desktop's VM (`max_ptes_none=511`), and khugepaged collapses 2 MiB-aligned
+  Zend MM chunks into huge pages whenever its scan reaches them (6 MiB of the test's
+  ~33 MiB RSS were `AnonHugePages`). The test now calls `prctl(PR_SET_THP_DISABLE)`
+  first; RSS is then constant (8.5: 30,364 KiB, 8.4: 27,680 KiB, +0.00% at every
+  sample, 100k requests).
+- **DESIGN.md changes:** §5.1.1 INI precedence now starts with the default INI; new
+  §5.1.2 "Default INI" (table, OPcache defaults left alone, production recommendation,
+  preloading: runtime thread, output to stdout not the log, `opcache.preload_user`
+  rules); §5.1 limitation paragraph quantified; §5.4 preload sentence; new §5.7
+  "Performance characteristics"; §9 lists the new tests and the benchmark.
+- **Gotchas:** preloading as **root** requires `opcache.preload_user`; set it to
+  `root` (in-process). Any other user makes OPcache `fork()` to preload — avoid in
+  this multi-threaded host. As non-root, leave it unset (OPcache warns otherwise).
+  A user `disable_functions` replaces the pcntl list entirely.
+- **Acceptance evidence** (PHP 8.4.26 and 8.5.11, toolchain image): `cargo fmt
+  --check`, `cargo clippy --workspace --all-targets --all-features -- -D warnings` and
+  `cargo test --workspace --all-features` pass on both; leak check (`tests/leak-check.sh`)
+  OK on both.
 
 **Notes from other steps:**
 - From S2: **benchmark from the container's own filesystem, not `/work`.** On Docker
@@ -602,7 +655,21 @@ make honest throughput claims.
   is the first real run. The entrypoint needs `vendor/autoload.php` (composer install
   in the image).
 
-**Notes from other steps:** _(none yet)_
+**Notes from other steps:**
+- From S4: **switch the benchmark to the real framework.** S4's benchmark
+  (`crates/k4p-php-sys/benches/request_cost.rs`) runs on an ad-hoc stand-in for this
+  package, `crates/k4p-php-sys/benches/app/src/Framework/` (namespace
+  `Bench\Framework\`), because `php/` didn't exist yet. As part of S5:
+  - make `benches/app/composer.json` require `kafka4php/framework` through a composer
+    `path` repository pointing at `php/` (the bench copies the app to a temp dir, so
+    use an absolute path or have the bench rewrite it; `composer dump-autoload` is no
+    longer enough — it needs `composer install`/`update`, offline, from the path repo);
+  - port `consumer.php`, `preload.php` and `src/App/OrderPlacedHandler.php` to
+    `Kafka4php\…`, and delete `benches/app/src/Framework/`;
+  - run `scripts/dev.sh cargo bench -p k4p-php-sys --bench request_cost` on PHP 8.4
+    and 8.5 (laptop on AC power, nothing else running) and update the table, system
+    details and ratios in DESIGN.md §5.7 and the description of the `kernel`
+    scenario there.
 
 ---
 
@@ -788,6 +855,12 @@ covering DESIGN.md §9's E2E scenarios.
 - From S2 (decision): no OPcache on PHP 8.4 under SAPI `kafka4php` (DESIGN.md §5.1). The
   example app's preload script and any OPcache/preload E2E checks only apply to the 8.5
   image; the 8.4 E2E run must not depend on OPcache.
+- From S4: the "default INI" is compiled into the SAPI (DESIGN.md §5.1.2): the image
+  ships nothing for it. The production config/example should set
+  `opcache.validate_timestamps = "0"` under `[php.ini]` (code in an image never
+  changes). As a non-root user, don't set `opcache.preload_user` (it is only needed,
+  as `root`, when running as root). Preload output goes to the process stdout, not the
+  log.
 - From S5: the framework (`php/`) has never run inside the SAPI — only unit-tested
   with `FakeNativeBridge`. The example app should use `Kernel::run()` with the default
   `NativeFunctionsBridge`, so the E2E covers it; include one invalid `Content` (e.g.
@@ -826,3 +899,7 @@ building it).
   PHP 8.4 runs **without OPcache** (and so without preload / JIT) because PHP 8.4
   only enables OPcache for a fixed list of SAPI names; PHP 8.5 has full OPcache.
   Recommend the 8.5 image when performance matters. DESIGN.md §5.1.
+- From S4: the performance page comes from DESIGN.md §5.7 — quote the ratios
+  (OPcache ≈ 25× for a typical entrypoint, preload ≈ −25%), not the absolute numbers
+  of a dev laptop; ideally re-run `cargo bench -p k4p-php-sys --bench request_cost` on
+  a Linux host. Document the default INI (§5.1.2) and the preload/`preload_user` rules.

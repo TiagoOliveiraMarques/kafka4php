@@ -33,5 +33,18 @@ harness = false
 name = "leaks"
 harness = false
 
+[[test]]
+name = "opcache"
+harness = false
+
+[[test]]
+name = "default_ini"
+harness = false
+
+# Per-request cost (PLAN.md S4): its own driver, one child process per row.
+[[bench]]
+name = "request_cost"
+harness = false
+
 [lints]
 workspace = true

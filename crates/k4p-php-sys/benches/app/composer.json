@@ -1,0 +1,12 @@
+{
+    "name": "kafka4php/bench-app",
+    "description": "Benchmark fixture: a stand-in for kafka4php/framework (DESIGN.md §5.4) and a trivial handler",
+    "type": "project",
+    "license": "proprietary",
+    "autoload": {
+        "psr-4": {
+            "Bench\\Framework\\": "src/Framework/",
+            "Bench\\App\\": "src/App/"
+        }
+    }
+}
