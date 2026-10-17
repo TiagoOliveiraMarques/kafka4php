@@ -8,6 +8,7 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::ffi::{c_int, c_ulong};
 
 use common::{Case, fixtures};
 use k4p_core::HandlerResult;
@@ -16,6 +17,23 @@ use k4p_php_sys::{RuntimeConfig, execute};
 
 const WARMUP: usize = 1_000;
 const SAMPLE_EVERY: usize = 10_000;
+
+unsafe extern "C" {
+    fn prctl(option: c_int, ...) -> c_int;
+}
+
+/// Turns transparent huge pages off for this process. With THP `always` (Docker
+/// Desktop's VM), khugepaged collapses any 2 MiB-aligned region with a touched page
+/// (Zend MM chunks are 2 MiB-aligned) into a huge page whenever its scan gets there,
+/// raising RSS by up to 2 MiB at a random point of the run: not a leak.
+fn disable_thp() {
+    const PR_SET_THP_DISABLE: c_int = 41;
+    let one: c_ulong = 1;
+    let zero: c_ulong = 0;
+    // SAFETY: plain syscall wrapper; PR_SET_THP_DISABLE takes four unsigned longs.
+    let rc = unsafe { prctl(PR_SET_THP_DISABLE, one, zero, zero, zero) };
+    assert_eq!(rc, 0, "prctl(PR_SET_THP_DISABLE)");
+}
 
 fn rss_kib() -> u64 {
     let status = std::fs::read_to_string("/proc/self/status").expect("/proc/self/status");
@@ -101,6 +119,8 @@ fn memory_stability() {
 }
 
 fn main() {
+    // Before PHP allocates anything.
+    disable_thp();
     // Run the fixture from a local copy: on Docker Desktop for Windows the repo is a
     // bind mount where every open()/stat() costs milliseconds, which would dominate the
     // request time (~5 ms instead of ~1.7 ms) and test nothing about PHP.

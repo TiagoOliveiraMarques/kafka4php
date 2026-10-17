@@ -1,4 +1,4 @@
-//! Shared harness for the k4p-php-sys integration tests.
+//! Shared harness for the k4p-php-sys integration tests (and the `request_cost` bench).
 //!
 //! PHP can be started only once per process, on a thread that outlives all PHP use.
 //! Each test binary therefore has its own `main` (`harness = false`): it starts the
@@ -84,6 +84,11 @@ pub fn run(config: RuntimeConfig, cases: &[Case]) -> ! {
     for l in &startup_logs {
         eprintln!("startup log: {l:?} {}", l.text());
     }
+    // No test configures PHP to warn at startup (e.g. a broken preload script).
+    assert!(
+        startup_logs.iter().all(|l| l.source != "error"),
+        "PHP reported errors during runtime init"
+    );
 
     let cases: Vec<Case> = cases
         .iter()
