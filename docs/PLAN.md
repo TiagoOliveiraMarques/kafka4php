@@ -650,10 +650,20 @@ make honest throughput claims.
   8.4.26 and 8.5.11. CI: new `php-framework` job (matrix 8.4/8.5) in
   `.github/workflows/build.yml`. No PowerShell wrapper — run it from Git Bash.
   `php/composer.lock` is gitignored (library).
-- **For S9:** `NativeFunctionsBridge` / the stubs have only been checked against the C
-  sources (keys and shapes), never executed inside the SAPI — the example app's E2E
-  is the first real run. The entrypoint needs `vendor/autoload.php` (composer install
-  in the image).
+- **Benchmark (S4's note, done):** `crates/k4p-php-sys/benches/app/` now requires
+  `kafka4php/framework` (path repository `../framework`, Packagist disabled) and its
+  stand-in `src/Framework/` is gone. The bench driver stages `php/composer.json` +
+  `php/src/` as `<temp>/framework` (not `php/vendor/`: copying that off the bind mount
+  took 3.5 min) and runs `composer update --optimize-autoloader --no-dev` in
+  `<temp>/app` once for all child runs (`K4P_BENCH_APP`). Re-recorded on PHP 8.4 and
+  8.5 (same laptop, AC power): DESIGN.md §5.7. `kernel` costs 32 µs with OPcache (was
+  27 µs) and 833 µs without (was 673 µs): the framework's two extra classes per
+  request (`CallableHandler`, `ExceptionPolicy`) and twice the source. Ratios: OPcache
+  still ~25×, preload now −30%.
+- **For S9:** inside the SAPI, the framework has only run via the benchmark: `Kernel` +
+  `Router` + `NativeFunctionsBridge` → `NoContent`, 8.4 and 8.5. The other results and
+  the exception policy are covered by unit tests only. The entrypoint needs
+  `vendor/autoload.php` (composer install in the image).
 
 **Notes from other steps:**
 - From S4: **switch the benchmark to the real framework.** S4's benchmark
@@ -861,10 +871,11 @@ covering DESIGN.md §9's E2E scenarios.
   changes). As a non-root user, don't set `opcache.preload_user` (it is only needed,
   as `root`, when running as root). Preload output goes to the process stdout, not the
   log.
-- From S5: the framework (`php/`) has never run inside the SAPI — only unit-tested
-  with `FakeNativeBridge`. The example app should use `Kernel::run()` with the default
-  `NativeFunctionsBridge`, so the E2E covers it; include one invalid `Content` (e.g.
-  empty topic), since PHP doesn't validate results — C does (§5.2).
+- From S5: inside the SAPI the framework (`php/`) has only run the S4 benchmark's
+  `NoContent` path; every other result and the exception policy are unit-tested with
+  `FakeNativeBridge` only. The example app should use `Kernel::run()` with the default
+  `NativeFunctionsBridge` and exercise every result kind; include one invalid `Content`
+  (e.g. empty topic), since PHP doesn't validate results — C does (§5.2).
 
 ---
 
@@ -900,6 +911,7 @@ building it).
   only enables OPcache for a fixed list of SAPI names; PHP 8.5 has full OPcache.
   Recommend the 8.5 image when performance matters. DESIGN.md §5.1.
 - From S4: the performance page comes from DESIGN.md §5.7 — quote the ratios
-  (OPcache ≈ 25× for a typical entrypoint, preload ≈ −25%), not the absolute numbers
+  (OPcache ≈ 25× for a typical entrypoint, preload ≈ −30% — S5 re-recorded it on the
+  real framework), not the absolute numbers
   of a dev laptop; ideally re-run `cargo bench -p k4p-php-sys --bench request_cost` on
   a Linux host. Document the default INI (§5.1.2) and the preload/`preload_user` rules.

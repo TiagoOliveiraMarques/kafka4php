@@ -663,48 +663,54 @@ Per-request cost of the SAPI on **one PHP thread**, sequential requests, measure
 `cargo bench -p k4p-php-sys --bench request_cost` (median of 3 runs × 50,000 requests
 per row, after 1,000 warm-up requests; scripts on the container's own filesystem).
 Scenarios: `empty` = an entrypoint that only calls `result()` (the host + request
-lifecycle floor); `kernel` = a typical entrypoint: composer autoloader
-(`dump-autoload --optimize`), a stand-in for `Kernel::run` + `Router` (§5.4) and a
-trivial handler (decode a small JSON value, return `NoContent`), ~15 classes per
-request; `preload` = `kernel` with all app classes in `opcache.preload`. OPcache `on` =
-PHP defaults, `on-vt0` = plus `opcache.validate_timestamps=0`.
+lifecycle floor); `kernel` = a typical entrypoint: composer autoloader (optimized),
+the real `kafka4php/framework` `Kernel::run` + `Router` (§5.4) and a trivial handler
+(decode a small JSON value, return `NoContent`), ~15 classes per request (11 of the
+framework); `preload` = `kernel` with all app and framework classes in
+`opcache.preload`. OPcache `on` = PHP defaults, `on-vt0` = plus
+`opcache.validate_timestamps=0`.
 
 | scenario | OPcache | req/s | mean µs | p50 µs | p99 µs |
 |---|---|---:|---:|---:|---:|
-| empty | off (8.4) | 49,452 | 20.2 | 18.1 | 50.7 |
-| empty | off (8.5) | 47,766 | 20.9 | 18.7 | 53.9 |
-| empty | on | 92,894 | 10.8 | 9.8 | 30.8 |
-| empty | on-vt0 | 93,338 | 10.7 | 9.8 | 24.9 |
-| kernel | off (8.4) | 1,485 | 673.3 | 642.1 | 1,128.2 |
-| kernel | off (8.5) | 1,458 | 685.9 | 646.3 | 1,232.5 |
-| kernel | on | 36,745 | 27.2 | 24.8 | 66.7 |
-| kernel | on-vt0 | 36,827 | 27.2 | 24.6 | 67.6 |
-| preload | on | 48,441 | 20.6 | 18.9 | 54.5 |
-| preload | on-vt0 | 48,058 | 20.8 | 18.9 | 55.0 |
+| empty | off (8.4) | 49,625 | 20.2 | 18.3 | 48.2 |
+| empty | off (8.5) | 45,650 | 21.9 | 19.7 | 54.8 |
+| empty | on | 91,463 | 10.9 | 10.2 | 23.4 |
+| empty | on-vt0 | 92,975 | 10.8 | 10.0 | 23.6 |
+| kernel | off (8.4) | 1,200 | 833.6 | 794.3 | 1,339.4 |
+| kernel | off (8.5) | 1,201 | 832.5 | 794.1 | 1,310.1 |
+| kernel | on | 31,199 | 32.1 | 29.9 | 68.6 |
+| kernel | on-vt0 | 31,711 | 31.5 | 28.8 | 73.7 |
+| preload | on | 44,975 | 22.2 | 20.6 | 54.2 |
+| preload | on-vt0 | 45,372 | 22.0 | 20.5 | 54.5 |
 
-`on` rows are PHP 8.5.11 (8.4.26 has no OPcache under our SAPI, §5.1).
+`on` rows are PHP 8.5.11 (8.4.26 has no OPcache under our SAPI, §5.1). The first
+recording (S4) ran `kernel` on a smaller stand-in framework (9 classes, half the
+source): 27.2 µs with OPcache, 673 µs without, 20.6 µs preloaded — the real one's two
+extra classes per request (`CallableHandler`, the `ExceptionPolicy` enum of
+`Kernel::run`'s default argument) and larger files cost ~5 µs with OPcache and
+~160 µs without it.
 
-**System** (run 2026-10-17; the bench prints the container-side lines itself):
+**System** (both recordings 2026-10-17; the bench prints the container-side lines itself):
 
 - Host: ASUS ROG Zephyrus G14 (GA401IU) laptop, **on AC power**, Windows 11 Home
   (10.0.26200), power plan "High performance".
 - CPU: AMD Ryzen 7 4800HS (8 cores / 16 threads, 2.9 GHz base); 16 CPUs visible in
   the container.
-- Memory: 31.4 GiB host; 15.3 GiB in the Docker Desktop VM (13.8 GiB available).
+- Memory: 31.4 GiB host; 15.3 GiB in the Docker Desktop VM (13.8–13.9 GiB available).
 - Docker Desktop (engine 28.3.3), WSL2 kernel 5.15.167.4-microsoft-standard-WSL2,
   transparent huge pages `always`; toolchain image (Debian bookworm), no other
   containers running.
 
 **Run-to-run variance:** the same machine on battery power measured every row ~3×
-slower (e.g. `kernel`/on 82 µs, `kernel`/off 2.1 ms) with wider tails; the ratios
+slower (S4 stand-in: `kernel`/on 82 µs, `kernel`/off 2.1 ms) with wider tails; the ratios
 below held in every run and are the claims to rely on:
 
 - **OPcache is the lever that matters.** Without it a typical entrypoint recompiles
   every file it includes on every message: `kernel` is **~25× slower** than with
-  OPcache (≈ 1.5k msg/s per thread vs ≈ 37k here). This is the cost of PHP 8.4 (§5.1).
+  OPcache (≈ 1.2k msg/s per thread vs ≈ 31k here). This is the cost of PHP 8.4 (§5.1).
 - The host + request lifecycle floor (`empty`, OPcache on) is ~11 µs per message
   (≈ 90k msg/s per thread); OPcache halves even that.
-- **Preload** saves ~25% over `kernel` with ~15 classes per message (27 → 21 µs); it
+- **Preload** saves ~30% over `kernel` with ~15 classes per message (32 → 22 µs); it
   pays more the more classes a message loads.
 - `validate_timestamps=0` is within run-to-run noise from a local filesystem (it saves
   `stat()` calls, which matter on slow filesystems: on the Docker Desktop bind mount

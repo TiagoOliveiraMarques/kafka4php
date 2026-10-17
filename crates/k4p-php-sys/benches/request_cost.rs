@@ -3,10 +3,10 @@
 //!
 //! Scenarios (fixture app in `benches/app/`):
 //! - `empty`: an entrypoint that only calls `result()`;
-//! - `kernel`: a typical entrypoint: the composer autoloader (`dump-autoload
-//!   --optimize`), a stand-in for `Kernel::run` and `Router`, and a trivial handler
+//! - `kernel`: a typical entrypoint: the composer autoloader (optimized), the real
+//!   `kafka4php/framework` (`php/`) `Kernel::run` and `Router`, and a trivial handler
 //!   (decode JSON, return `NoContent`); ~15 classes loaded per request;
-//! - `preload`: `kernel` with every app class in `opcache.preload`.
+//! - `preload`: `kernel` with every app and framework class in `opcache.preload`.
 //!
 //! each with OPcache `off`, `on` (PHP defaults) and `on-vt0` (`validate_timestamps=0`):
 //! see [`ROWS`]. PHP 8.4 runs only the `off` rows (OPcache is inactive under our SAPI).
@@ -16,8 +16,9 @@
 //! PHP can start once per process, so the driver re-runs this binary [`RUNS`] times per
 //! row (`K4P_BENCH_ROW=<scenario>/<opcache>`), each child running the measurement as
 //! the single case of the shared test harness, and prints a Markdown table of the
-//! median runs, preceded by the system it ran on. The app is copied to a temp dir first:
-//! off the slow `/work` bind mount of Docker Desktop. Env: `K4P_BENCH_REQUESTS`
+//! median runs, preceded by the system it ran on. The driver first copies the app to a
+//! temp dir (off the slow `/work` bind mount of Docker Desktop) and `composer update`s
+//! it there, offline, once for all children (`K4P_BENCH_APP`). Env: `K4P_BENCH_REQUESTS`
 //! (measured requests per row, default 20,000).
 
 #[path = "../tests/common/mod.rs"]
@@ -160,10 +161,12 @@ fn php_version_id() -> u32 {
         .expect("PHP version number")
 }
 
-/// Runs `row` once in a child process; `None` (and the child's output) if it failed.
-fn run_child(exe: &Path, row: &Row) -> Option<Stats> {
+/// Runs `row` once in a child process on `app`; `None` (and the child's output) if it
+/// failed.
+fn run_child(exe: &Path, app: &Path, row: &Row) -> Option<Stats> {
     let out = Command::new(exe)
         .env("K4P_BENCH_ROW", row.id())
+        .env("K4P_BENCH_APP", app)
         .output()
         .expect("run benchmark child");
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -241,12 +244,13 @@ fn driver() {
     println!("| scenario | OPcache | req/s | mean µs | p50 µs | p99 µs |");
     println!("|---|---|---:|---:|---:|---:|");
     let exe = std::env::current_exe().expect("current_exe");
+    let app = prepare_app();
     let mut failed = false;
     for row in ROWS
         .iter()
         .filter(|r| version >= 80500 || r.opcache == "off")
     {
-        let runs: Option<Vec<Stats>> = (0..RUNS).map(|_| run_child(&exe, row)).collect();
+        let runs: Option<Vec<Stats>> = (0..RUNS).map(|_| run_child(&exe, &app, row)).collect();
         let Some(mut runs) = runs else {
             failed = true;
             continue;
@@ -259,6 +263,7 @@ fn driver() {
         );
     }
     println!();
+    let _ = std::fs::remove_dir_all(app.parent().expect("temp root"));
     if failed {
         std::process::exit(1);
     }
@@ -280,22 +285,37 @@ fn copy_dir(from: &Path, to: &Path) {
     }
 }
 
-/// A copy of `benches/app` in a temp dir, with its composer autoloader generated.
-fn prepare_app() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("k4p-bench-{}", std::process::id()));
-    copy_dir(
-        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/app"),
-        &dir,
-    );
+/// Runs `composer <args>` in `dir`.
+fn composer(dir: &Path, args: &[&str]) {
     let status = Command::new("composer")
-        .args(["dump-autoload", "--optimize", "--no-interaction", "--quiet"])
-        .arg("--working-dir")
-        .arg(&dir)
+        .args(args)
+        .args(["--no-interaction", "--quiet", "--working-dir"])
+        .arg(dir)
         .env("COMPOSER_ALLOW_SUPERUSER", "1")
         .status()
         .expect("run composer (in the toolchain container)");
-    assert!(status.success(), "composer dump-autoload failed");
-    dir
+    assert!(status.success(), "composer {args:?} failed");
+}
+
+/// `<temp>/app`: a copy of `benches/app` with its dependencies installed and an
+/// optimized autoloader. Its only dependency, the real `kafka4php/framework`, comes
+/// from `<temp>/framework` (the app's composer.json has that path repository and no
+/// Packagist, so this is offline): `php/composer.json` and `php/src/`, all a dependency
+/// needs — not `php/vendor/`, slow to copy from the bind mount.
+fn prepare_app() -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = std::env::temp_dir().join(format!("k4p-bench-{}", std::process::id()));
+    let (php, framework, app) = (
+        manifest.join("../../php"),
+        root.join("framework"),
+        root.join("app"),
+    );
+    copy_dir(&php.join("src"), &framework.join("src"));
+    std::fs::copy(php.join("composer.json"), framework.join("composer.json"))
+        .expect("copy php/composer.json");
+    copy_dir(&manifest.join("benches/app"), &app);
+    composer(&app, &["update", "--optimize-autoloader", "--no-dev"]);
+    app
 }
 
 fn micros(d: Duration) -> f64 {
@@ -338,12 +358,12 @@ fn measure() {
     println!("{}", stats.to_line());
 }
 
-fn child(id: &str) -> ! {
+/// One run of row `id` on the app the driver prepared.
+fn child(id: &str, app: &Path) -> ! {
     let row = ROWS
         .iter()
         .find(|r| r.id() == id)
         .unwrap_or_else(|| panic!("unknown K4P_BENCH_ROW {id}"));
-    let app = prepare_app();
     let app_dir = app.to_str().expect("UTF-8 temp dir");
     let config = RuntimeConfig {
         entrypoint: app.join(row.entrypoint()),
@@ -359,7 +379,10 @@ fn child(id: &str) -> ! {
 
 fn main() {
     match std::env::var("K4P_BENCH_ROW") {
-        Ok(id) => child(&id),
+        Ok(id) => {
+            let app = std::env::var_os("K4P_BENCH_APP").expect("K4P_BENCH_APP");
+            child(&id, Path::new(&app))
+        }
         Err(_) => driver(),
     }
 }

@@ -4,10 +4,10 @@ declare(strict_types=1);
 
 namespace Bench\App;
 
-use Bench\Framework\Handler;
-use Bench\Framework\Message;
-use Bench\Framework\Result\NoContent;
-use Bench\Framework\Result\Result;
+use Kafka4php\Handler;
+use Kafka4php\Message;
+use Kafka4php\Result\NoContent;
+use Kafka4php\Result\Result;
 
 /** A trivial handler: decode the JSON value, return NoContent. */
 final class OrderPlacedHandler implements Handler
