@@ -154,8 +154,17 @@ static void k4p_sapi_log_message(const char *message, int syslog_type_int)
     ZVAL_NEW_STR(&tmp, zend_string_init(value, sizeof(value) - 1, 1));                \
     zend_hash_str_update(configuration_hash, name, sizeof(name) - 1, &tmp);
 
-/* Every pcntl function of PHP 8.4 and 8.5: signals, fork and exec belong to the host
- * (DESIGN.md §5.6). Disabling a function that isn't installed is a no-op. */
+/* Every pcntl function of PHP 8.4 and 8.5, disabled because a handler must not touch
+ * process-wide state that the host owns (DESIGN.md §5.6):
+ *   - pcntl_fork & co. would fork the whole multi-threaded host: the child keeps only
+ *     the calling thread, plus the Kafka sockets and other threads' held locks;
+ *   - pcntl_signal / pcntl_async_signals / pcntl_alarm install process-wide signal
+ *     handlers, stealing SIGTERM / SIGINT from the host's graceful shutdown;
+ *   - pcntl_exec replaces the host process;
+ *   - the rest (wait*, wif*, priority, affinity, ...) only make sense after a fork or
+ *     change the whole process.
+ * Disabling a function that isn't installed (pcntl is not in the default image) is a
+ * no-op. */
 #define K4P_DISABLED_PCNTL                                                           \
     "pcntl_alarm,pcntl_async_signals,pcntl_errno,pcntl_exec,pcntl_fork,pcntl_forkx,"  \
     "pcntl_get_last_error,pcntl_getcpu,pcntl_getcpuaffinity,pcntl_getpriority,"       \
