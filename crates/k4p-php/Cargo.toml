@@ -8,6 +8,29 @@ publish = false
 
 [dependencies]
 k4p-core.workspace = true
+k4p-php-sys = { path = "../k4p-php-sys" }
+tokio = { workspace = true, features = ["sync"] }
+fastrand = "2"
+tracing = "0.1"
+
+[dev-dependencies]
+k4p-core = { workspace = true, features = ["testing"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "sync", "macros"] }
+
+# PHP can be started once per process: each integration test binary starts its own
+# pool on the main thread and runs its cases sequentially (see tests/common/mod.rs),
+# so it uses its own harness instead of libtest's.
+[[test]]
+name = "pool"
+harness = false
+
+[[test]]
+name = "hard_timeout"
+harness = false
+
+[[test]]
+name = "recycling"
+harness = false
 
 [lints]
 workspace = true
