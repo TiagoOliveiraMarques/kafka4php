@@ -21,3 +21,4 @@ message as one isolated PHP request, like PHP-FPM does for HTTP.
   everything inside the toolchain container (`scripts/dev.sh` / `scripts/dev.ps1`,
   created in step S1). Keep files LF.
 - A step isn't done while any test is failing or skipped.
+- Always run the thermo nuclear code quality review skill before creating a PR.
