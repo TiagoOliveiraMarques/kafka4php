@@ -166,9 +166,12 @@ cargo inside it from a Windows host.
   has to come from a separate, test-only Dockerfile, or the check is documented
   as infeasible (as the S2 criteria allow).
   Headers: `php-config --includes`; `sapi/embed/php_embed.h` is installed.
-- **CI:** `.github/workflows/build.yml` builds the image for PHP 8.4 and 8.5 on
-  every PR and push to `main` (GitHub Actions cache per version). It's green iff the
-  image builds, including the PHP checks. The full `scripts/ci.sh` is S9.
+- **CI:** `.github/workflows/build.yml`, on every PR and push to `main`, for PHP 8.4
+  and 8.5: `build and test` builds the image (GitHub Actions cache per version) and
+  runs `cargo fmt --check`, clippy `-D warnings` and `cargo test --workspace
+  --all-features` inside it; `leak check` runs `crates/k4p-php-sys/tests/leak-check.sh`
+  (added in S2). **New test suites must run in this workflow** (anything `cargo test`
+  picks up does automatically). The full `scripts/ci.sh` is S9.
 - **Files:** `docker/dev.Dockerfile` (+ `dev.Dockerfile.dockerignore`: the build
   context is only `rust-toolchain.toml` and `docker/php-check.sh`), `docker/php-check.sh`,
   `docker/compose.test.yml`, `scripts/dev.sh`, `scripts/dev.ps1`, `scripts/kafka-check.sh`,
@@ -254,14 +257,17 @@ outcome classification and no per-request memory growth. Highest-risk step.
   why the check isn't feasible and what was done instead.
 
 **Handoff notes:**
-- **Built** (`crates/k4p-php-sys/`): `csrc/k4p_sapi.h` (the C ABI, plain C types),
+- **Built** (`crates/k4p-php-sys/`): `csrc/k4p_sapi.h` (the C ABI, plain C types);
   `csrc/k4p_sapi.c` (SAPI module `kafka4php`, native module/extension `kafka4php`
-  with `Kafka4php\Native\message()` / `result()`, per-thread state, script execution,
-  classification), `build.rs` (php-config → `cc` → link `libphp.so` → bindgen of
-  our header only), `src/lib.rs` (`ffi` bindings; `CMessage` = `InboundMessage` → C
-  borrowing its bytes; `COutcome` = C outcome → owned `k4p_core::Outcome`, frees on
-  drop; thin wrappers `runtime_init`/`runtime_shutdown` (unsafe), `thread_init`,
-  `thread_shutdown`, `execute`), fixtures in `tests/fixtures/`, tests `sapi`,
+  with `Kafka4php\Native\message()` / `result()`, per-thread phase + outcome slots,
+  script execution, classification, lifecycle), `csrc/k4p_result.c` (`result()`
+  validation/conversion), `csrc/k4p_output.c` (log sink, stdout lines),
+  `csrc/k4p_buf.c` (malloc'd buffers/outcomes, UTF-8), `csrc/k4p_internal.h`;
+  `build.rs` (php-config → `cc` on every `csrc/*.c` → link `libphp.so` → bindgen of
+  our header only); `src/lib.rs` (`ffi` bindings; public API `RuntimeConfig`,
+  `InitError`, `runtime_init`/`runtime_shutdown` (unsafe), `thread_init`,
+  `thread_shutdown`, `execute`; the C conversions are private), fixtures in
+  `tests/fixtures/`, tests `sapi`,
   `memory`, `leaks`, and the debug-PHP leak check (`tests/leak-check.sh` +
   `tests/debug-php.Dockerfile`).
 - **The final C ABI, thread-local design, INI handling and log callback contract are

@@ -15,7 +15,6 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Instant;
 
-use k4p_core::InboundMessage;
 use k4p_php_sys::{RuntimeConfig, ffi};
 
 /// One call of the log callback.
@@ -68,21 +67,6 @@ pub fn take_logs() -> Vec<LogRecord> {
 
 pub fn fixtures() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
-}
-
-/// A message with sensible defaults.
-pub fn msg(topic: &str) -> InboundMessage {
-    InboundMessage {
-        topic: topic.to_owned(),
-        delivery_topic: topic.to_owned(),
-        partition: 0,
-        offset: 0,
-        timestamp_ms: None,
-        key: None,
-        value: None,
-        headers: Vec::new(),
-        attempt: 1,
-    }
 }
 
 pub type Case = (&'static str, fn());

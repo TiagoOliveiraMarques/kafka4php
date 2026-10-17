@@ -242,7 +242,9 @@ exception they handle is not "uncaught". Then, still inside the request,
 `register_shutdown_function()` callbacks run (they would be the first thing
 `php_request_shutdown()` does): they are part of the script, so their `result()`
 counts. Destructors of objects alive at request end run in `php_request_shutdown()`,
-after classification.
+after classification. Because these two functions are copies of PHP internals,
+**re-check them against `main/main.c` and `Zend/zend.c` on every new PHP minor
+version** (the sapi test suite covers their observable behaviour).
 
 **Request info.** `SG(server_context)` points at the thread's state;
 `SG(request_info)`: no method/query/URI, `path_translated` = entrypoint,
@@ -254,10 +256,18 @@ the pool should replace it.
 #### 5.1.1 The C ABI (`crates/k4p-php-sys/csrc/k4p_sapi.h`)
 
 Plain C types only; bindgen sees only this header. All functions are C-callable from
-Rust through `k4p_php_sys::ffi`; `k4p_php_sys` adds `CMessage` (borrowed
-`InboundMessage` → C), `COutcome` (C outcome → owned `Outcome`, frees on drop) and
-thin wrappers `runtime_init` / `runtime_shutdown` (unsafe) / `thread_init` /
-`thread_shutdown` / `execute`.
+Rust through `k4p_php_sys::ffi`. The safe public API of `k4p_php_sys` is
+`RuntimeConfig`, `InitError`, `runtime_init` / `runtime_shutdown` (unsafe),
+`thread_init` / `thread_shutdown` and `execute(&InboundMessage) -> Outcome`; the C
+conversions behind `execute` are private. The C side is the authoritative validator
+of handler results: Rust trusts a filled outcome (non-UTF-8 topics or header names
+are only `debug_assert`ed) and treats an unknown outcome kind as a bug (`unreachable!`).
+
+Sources (`csrc/`): `k4p_sapi.h` (the ABI), `k4p_internal.h` (private declarations),
+`k4p_sapi.c` (SAPI + native module, request execution, classification, lifecycle),
+`k4p_result.c` (`result()` arrays → `k4p_outcome`, the only C code that knows the
+§5.2 shapes), `k4p_output.c` (log sink, stdout line buffering), `k4p_buf.c` (malloc'd
+buffers/outcomes, UTF-8 validation).
 
 ```c
 typedef struct { const uint8_t *data; size_t len; uint8_t is_null; } k4p_buf; // bytes, NUL-safe
@@ -276,7 +286,7 @@ typedef struct { k4p_outcome_kind kind; k4p_outbound *messages; size_t messages_
                  k4p_buf text;          // reason / error message
                  k4p_buf class_name;    // Fail.error_class / exception class
                } k4p_outcome;
-typedef enum { K4P_LOG_ERROR = 1, K4P_LOG_WARN = 2, K4P_LOG_INFO = 3, K4P_LOG_DEBUG = 4 } k4p_log_level;
+typedef enum { K4P_LOG_ERROR = 1, K4P_LOG_WARN = 2, K4P_LOG_INFO = 3 } k4p_log_level;
 typedef void (*k4p_log_fn)(void *user_data, k4p_log_level level, const char *source,
                            const uint8_t *msg, size_t len);
 typedef struct { const char *ini_file; const char *ini_entries; const char *entrypoint;
@@ -306,10 +316,17 @@ Contract:
   `k4p_outcome_free` (idempotent). A non-null `k4p_buf` in an outcome never has a
   NULL `data`. Topics and header names in `Content` are validated UTF-8; `text` and
   `class_name` are not guaranteed UTF-8 (Rust converts them lossily).
-- **Thread-local state** (C `__thread`, never zvals): the current message, the
-  pending result (already converted to `malloc` structs when `result()` is called),
-  the captured uncaught exception, and the stdout line buffer. The C file is built
-  with `ZEND_ENABLE_STATIC_TSRMLS_CACHE`; `k4p_runtime_init` / `k4p_thread_init` run
+- **Thread-local state** (C `__thread`, never zvals): the thread's **phase**
+  (`NONE` → `IDLE` → `SCRIPT` (result() accepted) → `FINISHING` → `IDLE`, or
+  `BROKEN` after a failed request startup), which every entry point checks; the
+  current message; and two outcome slots, each resolved when it happens:
+  `result` (the converted `result()` array, or `INVALID_RESULT`) and `uncaught`
+  (`UNCAUGHT_EXCEPTION`, or `INVALID_RESULT` when the uncaught exception is the
+  `\ValueError` that `result()` threw). Classification is then a fixed order:
+  soft timeout → `uncaught` → fatal error → `result` (`NO_RESULT` if never set). The
+  runtime thread is identified by its `pthread_t`. The stdout line buffer is a
+  separate `__thread` in `k4p_output.c`. Sources are built with
+  `ZEND_ENABLE_STATIC_TSRMLS_CACHE`; `k4p_runtime_init` / `k4p_thread_init` run
   `ZEND_TSRMLS_CACHE_UPDATE()`.
 
 **Log callback.** Called synchronously on the PHP thread that produced the output
@@ -726,7 +743,7 @@ logged with `source=php`.
   container (env `K4P_KAFKA_BOOTSTRAP=kafka:9092`). `scripts/kafka-check.sh`
   smoke-tests it (create topic, produce, consume).
 - **`k4p-php-sys` build.rs**: runs `php-config --includes --prefix` (`$PHP_CONFIG`
-  overrides the binary), compiles `csrc/k4p_sapi.c` with the `cc` crate (C11,
+  overrides the binary), compiles every `csrc/*.c` with the `cc` crate (C11,
   `-Wall -Wextra -Werror`, `ZEND_ENABLE_STATIC_TSRMLS_CACHE=1`), links
   `<prefix>/lib/libphp.so` dynamically (its own dependencies come with it; no
   `--libs`), bindgens only `csrc/k4p_sapi.h`. No rpath: the loader finds
@@ -760,6 +777,7 @@ logged with `source=php`.
 | `k4p-php-sys` / `k4p-php` | Rust tests in the toolchain container running real PHP scripts (`crates/k4p-php-sys/tests/fixtures/`, `crates/k4p-php/tests/fixtures/`): every outcome kind, binary-safe data round-trip, memory stability over ≥100k requests (RSS and `memory_get_usage` baseline stable), N-thread concurrency, recycling, soft and hard timeouts, abandoned-thread replacement. PHP can be started once per process, so these test binaries use `harness = false` with their own runner (init on the main thread, cases on a PHP worker thread). `crates/k4p-php-sys/tests/leak-check.sh` re-runs the SAPI tests on a ZTS **debug** PHP (`tests/debug-php.Dockerfile`) and fails on any reported request-memory leak, with a positive control. |
 | `k4p-host` | Unit tests with a `FakeExecutor` (scripted outcomes, delays). Integration tests against a real Kafka from `docker/compose.test.yml`: offsets, retry tiers & due-time, DLQ, max attempts, rebalance with in-flight messages, produce-failure blocking, backpressure. |
 | `php/` | PHPUnit + PHPStan (max level) using `FakeNativeBridge`. Runs on stock `php:8.x-cli`. |
+| CI | `.github/workflows/build.yml`, every PR and push to `main`, PHP 8.4 and 8.5: builds the toolchain image, runs `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace --all-features` in it, and the debug-PHP leak check. Every test suite must run there. |
 | E2E | `tests/e2e/`: production image + Kafka + `examples/basic`. Scenarios: happy path, `Content` produce, `Fail`→DLQ, retry→eventual success, max attempts→DLQ, uncaught exception, fatal error, soft/hard timeout, process crash (`posix_kill(getmypid(), SIGSEGV)`) then restart with static membership (no rebalance observed), graceful SIGTERM (no message lost or double-produced beyond at-least-once). |
 
 ---

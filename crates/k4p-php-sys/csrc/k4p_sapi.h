@@ -95,8 +95,7 @@ typedef struct k4p_outcome {
 typedef enum k4p_log_level {
     K4P_LOG_ERROR = 1,
     K4P_LOG_WARN = 2,
-    K4P_LOG_INFO = 3,
-    K4P_LOG_DEBUG = 4
+    K4P_LOG_INFO = 3
 } k4p_log_level;
 
 /* Log callback. `source` is a static NUL-terminated string:

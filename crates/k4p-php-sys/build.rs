@@ -1,4 +1,4 @@
-//! Builds the kafka4php SAPI (`csrc/*.c`) against the PHP found by `php-config`, links
+//! Builds the kafka4php SAPI (every `csrc/*.c`) against the PHP found by `php-config`, links
 //! `libphp` dynamically and generates bindings for our own header only (DESIGN.md §8).
 //!
 //! Env: `PHP_CONFIG` (default `php-config`) selects the PHP installation.
@@ -48,9 +48,15 @@ fn main() {
     );
 
     let csrc = Path::new("csrc");
+    let mut sources: Vec<PathBuf> = std::fs::read_dir(csrc)
+        .expect("k4p-php-sys: cannot read csrc/")
+        .map(|e| e.expect("k4p-php-sys: cannot read csrc/").path())
+        .filter(|p| p.extension().is_some_and(|ext| ext == "c"))
+        .collect();
+    sources.sort();
     let mut build = cc::Build::new();
     build
-        .file(csrc.join("k4p_sapi.c"))
+        .files(&sources)
         .include(csrc)
         .includes(&includes)
         .std("c11")

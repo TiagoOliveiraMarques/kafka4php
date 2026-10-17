@@ -9,8 +9,9 @@ mod common;
 
 use std::collections::BTreeMap;
 
-use common::{Case, fixtures, msg};
+use common::{Case, fixtures};
 use k4p_core::HandlerResult;
+use k4p_core::testing::inbound;
 use k4p_php_sys::{RuntimeConfig, execute};
 
 const WARMUP: usize = 1_000;
@@ -40,7 +41,7 @@ fn memory_stability() {
     let started = std::time::Instant::now();
 
     for i in 1..=requests {
-        let value = match execute(&msg("memory")) {
+        let value = match execute(&inbound("memory", 0, 0)) {
             Ok(HandlerResult::Content(m)) => m[0].value.clone().expect("value"),
             other => panic!("request {i}: {other:?}"),
         };

@@ -51,23 +51,16 @@ fn c_buf(bytes: Option<&[u8]>) -> ffi::k4p_buf {
     }
 }
 
-/// C view of an [`InboundMessage`], borrowing all its bytes. Pass [`CMessage::as_ptr`]
-/// to `k4p_execute`; the message must outlive the call (the borrow guarantees it).
-pub struct CMessage<'a> {
+/// C view of an [`InboundMessage`], borrowing all its bytes for the `k4p_execute` call.
+struct CMessage<'a> {
     raw: ffi::k4p_message,
     // Owns the header array `raw.headers` points into (heap buffer: stable on move).
     _headers: Vec<ffi::k4p_header>,
     _msg: PhantomData<&'a InboundMessage>,
 }
 
-impl fmt::Debug for CMessage<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CMessage").finish_non_exhaustive()
-    }
-}
-
 impl<'a> CMessage<'a> {
-    pub fn new(msg: &'a InboundMessage) -> Self {
+    fn new(msg: &'a InboundMessage) -> Self {
         let headers: Vec<ffi::k4p_header> = msg
             .headers
             .iter()
@@ -100,55 +93,45 @@ impl<'a> CMessage<'a> {
         }
     }
 
-    pub fn as_ptr(&self) -> *const ffi::k4p_message {
+    fn as_ptr(&self) -> *const ffi::k4p_message {
         &self.raw
     }
 }
 
 // ---------------------------------------------------------------------------------
 // C outcome -> Outcome
+//
+// The C side is the authoritative validator of handler results (it must throw the
+// `\ValueError` while the script runs, DESIGN.md §5.2): a filled outcome is trusted
+// here, and anything else is a bug in `csrc/`.
 
 /// An outcome filled by `k4p_execute`; frees its C memory on drop.
-pub struct COutcome(ffi::k4p_outcome);
-
-impl fmt::Debug for COutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("COutcome").field(&self.0.kind).finish()
-    }
-}
-
-impl Default for COutcome {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+struct COutcome(ffi::k4p_outcome);
 
 impl COutcome {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self(ffi::k4p_outcome::default())
     }
 
-    pub fn as_mut_ptr(&mut self) -> *mut ffi::k4p_outcome {
+    fn as_mut_ptr(&mut self) -> *mut ffi::k4p_outcome {
         &mut self.0
     }
 
-    /// Converts into an owned [`Outcome`] (copies; the C memory is freed on drop).
-    pub fn to_outcome(&self) -> Outcome {
+    /// Copies the outcome into owned Rust types; the C memory is freed on drop.
+    fn into_outcome(self) -> Outcome {
         use ffi::k4p_outcome_kind as K;
         let o = &self.0;
-        // SAFETY (all `bytes` calls): the C side fills `o` with valid malloc()ed
-        // buffers that live until `k4p_outcome_free`, i.e. until `self` is dropped.
+        // SAFETY (every `bytes` / `slice` call): the C side fills `o` with valid
+        // malloc()ed buffers that live until `k4p_outcome_free`, i.e. until `self` drops.
         let text = || lossy(unsafe { bytes(&o.text) });
         match o.kind {
             K::K4P_OUTCOME_NO_CONTENT => Ok(HandlerResult::NoContent),
-            K::K4P_OUTCOME_CONTENT => {
-                let msgs: &[ffi::k4p_outbound] = unsafe { slice(o.messages, o.messages_len) };
-                msgs.iter()
+            K::K4P_OUTCOME_CONTENT => Ok(HandlerResult::Content(
+                unsafe { slice(o.messages, o.messages_len) }
+                    .iter()
                     .map(|m| unsafe { outbound(m) })
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(HandlerResult::Content)
-                    .map_err(ExecutionError::InvalidResult)
-            }
+                    .collect(),
+            )),
             K::K4P_OUTCOME_FAIL => Ok(HandlerResult::Fail {
                 reason: text(),
                 error_class: unsafe { bytes(&o.class_name) }.map(|b| lossy(Some(b))),
@@ -163,10 +146,7 @@ impl COutcome {
             K::K4P_OUTCOME_FATAL_ERROR => Err(ExecutionError::FatalError(text())),
             K::K4P_OUTCOME_SOFT_TIMEOUT => Err(ExecutionError::SoftTimeout),
             K::K4P_OUTCOME_BOOTSTRAP => Err(ExecutionError::Bootstrap(text())),
-            other => Err(ExecutionError::Bootstrap(format!(
-                "unknown outcome kind {}",
-                other.0
-            ))),
+            other => unreachable!("k4p_execute returned unknown outcome kind {}", other.0),
         }
     }
 }
@@ -205,36 +185,35 @@ fn lossy(b: Option<&[u8]>) -> String {
     String::from_utf8_lossy(b.unwrap_or_default()).into_owned()
 }
 
-fn utf8(b: Option<&[u8]>, what: &str) -> Result<String, String> {
-    String::from_utf8(b.unwrap_or_default().to_vec()).map_err(|_| format!("{what} is not UTF-8"))
-}
-
-/// # Safety
-/// `h` must have been filled by the C side.
-unsafe fn headers(h: *const ffi::k4p_header, n: usize) -> Result<k4p_core::Headers, String> {
-    // SAFETY: guaranteed by the caller.
-    unsafe { slice(h, n) }
-        .iter()
-        .map(|h| {
-            // SAFETY: guaranteed by the caller.
-            let (k, v) = unsafe { (bytes(&h.key), bytes(&h.value)) };
-            Ok((utf8(k, "header name")?, v.map(<[u8]>::to_vec)))
-        })
-        .collect()
+/// A topic or header name: validated as UTF-8 by the C side.
+fn validated_utf8(b: Option<&[u8]>) -> String {
+    debug_assert!(
+        b.is_some_and(|b| std::str::from_utf8(b).is_ok()),
+        "k4p_sapi passed a non-UTF-8 topic or header name: {b:?}"
+    );
+    lossy(b)
 }
 
 /// # Safety
 /// `m` must have been filled by the C side.
-unsafe fn outbound(m: &ffi::k4p_outbound) -> Result<OutboundMessage, String> {
+unsafe fn outbound(m: &ffi::k4p_outbound) -> OutboundMessage {
     // SAFETY: guaranteed by the caller.
     unsafe {
-        Ok(OutboundMessage {
-            topic: utf8(bytes(&m.topic), "topic")?,
+        OutboundMessage {
+            topic: validated_utf8(bytes(&m.topic)),
             partition: (m.has_partition != 0).then_some(m.partition),
             key: bytes(&m.key).map(<[u8]>::to_vec),
             value: bytes(&m.value).map(<[u8]>::to_vec),
-            headers: headers(m.headers, m.headers_len)?,
-        })
+            headers: slice(m.headers, m.headers_len)
+                .iter()
+                .map(|h| {
+                    (
+                        validated_utf8(bytes(&h.key)),
+                        bytes(&h.value).map(<[u8]>::to_vec),
+                    )
+                })
+                .collect(),
+        }
     }
 }
 
@@ -350,5 +329,5 @@ pub fn execute(msg: &InboundMessage) -> Outcome {
     // SAFETY: `cmsg` borrows `msg` for the call; `out` is a valid, owned outcome. The
     // C side checks runtime/thread state and re-entrancy.
     unsafe { ffi::k4p_execute(cmsg.as_ptr(), out.as_mut_ptr()) };
-    out.to_outcome()
+    out.into_outcome()
 }

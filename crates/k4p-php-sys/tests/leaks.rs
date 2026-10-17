@@ -9,8 +9,9 @@
 
 mod common;
 
-use common::{Case, fixtures, msg};
-use k4p_core::ExecutionError;
+use common::{Case, fixtures};
+use k4p_core::testing::inbound;
+use k4p_core::{ExecutionError, HandlerResult};
 use k4p_php_sys::{RuntimeConfig, execute};
 
 const REQUESTS: usize = 1_000;
@@ -45,7 +46,7 @@ const MIX: &[(&str, &str)] = &[
 ];
 
 fn mixed_requests() {
-    let mut kinds = std::collections::BTreeMap::<String, usize>::new();
+    let mut kinds = std::collections::BTreeMap::<&str, usize>::new();
     for i in 0..REQUESTS {
         // A soft timeout costs 1 s: only a few of them.
         let (fixture, value) = if i % 250 == 249 {
@@ -53,19 +54,24 @@ fn mixed_requests() {
         } else {
             MIX[i % MIX.len()]
         };
-        let mut m = msg(fixture);
+        let mut m = inbound(fixture, 0, 0);
         m.value = Some(value.as_bytes().to_vec());
         m.headers = vec![("h".into(), Some(b"\0v".to_vec())), ("h".into(), None)];
-        let outcome = execute(&m);
-        if let Err(ExecutionError::Bootstrap(e)) = &outcome {
-            panic!("request {i} ({fixture}): bootstrap error {e}");
-        }
-        let kind = format!("{outcome:?}");
-        let kind = kind
-            .split(['(', ')', ' ', '{'])
-            .nth(1)
-            .unwrap_or(&kind)
-            .to_owned();
+        let kind = match execute(&m) {
+            Ok(HandlerResult::NoContent) => "NoContent",
+            Ok(HandlerResult::Content(_)) => "Content",
+            Ok(HandlerResult::Fail { .. }) => "Fail",
+            Ok(HandlerResult::RetryLater { .. }) => "RetryLater",
+            Err(ExecutionError::NoResult) => "NoResult",
+            Err(ExecutionError::InvalidResult(_)) => "InvalidResult",
+            Err(ExecutionError::UncaughtException { .. }) => "UncaughtException",
+            Err(ExecutionError::FatalError(_)) => "FatalError",
+            Err(ExecutionError::SoftTimeout) => "SoftTimeout",
+            Err(ExecutionError::HardTimeout) => "HardTimeout",
+            Err(ExecutionError::Bootstrap(e)) => {
+                panic!("request {i} ({fixture}): bootstrap error {e}")
+            }
+        };
         *kinds.entry(kind).or_default() += 1;
         common::take_logs();
     }
@@ -74,7 +80,7 @@ fn mixed_requests() {
 
 fn leak_control() {
     for _ in 0..10 {
-        execute(&msg("leak_control")).expect("leak_control");
+        execute(&inbound("leak_control", 0, 0)).expect("leak_control");
     }
 }
 

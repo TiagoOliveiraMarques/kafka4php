@@ -1,9 +1,7 @@
 /*
- * kafka4php SAPI (DESIGN.md §5.1-5.3).
- *
- * The custom "kafka4php" SAPI module, the native module with
- * Kafka4php\Native\message() / result(), the per-thread request state, the outcome
- * classification and the C ABI declared in k4p_sapi.h.
+ * kafka4php SAPI (DESIGN.md §5.1-5.3): the "kafka4php" SAPI module, the native module
+ * with Kafka4php\Native\message() / result(), request execution and outcome
+ * classification, and the runtime / thread lifecycle of the C ABI (k4p_sapi.h).
  *
  * References: PHP's sapi/embed/php_embed.c, main/main.c (php_execute_script_ex) and
  * Zend/zend.c (zend_execute_script); FrankenPHP's frankenphp.c (MIT).
@@ -11,10 +9,7 @@
  * Built with ZEND_ENABLE_STATIC_TSRMLS_CACHE (see build.rs): every thread that touches
  * PHP globals runs ZEND_TSRMLS_CACHE_UPDATE() after getting its interpreter globals.
  */
-#include "k4p_sapi.h"
-
-#include <stdarg.h>
-#include <stdio.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
@@ -30,13 +25,14 @@
 #include "ext/spl/spl_exceptions.h"
 #include "ext/standard/basic_functions.h"
 
+#include "k4p_internal.h"
+
 #ifndef ZTS
 #error "kafka4php requires a ZTS build of PHP"
 #endif
 
 ZEND_TSRMLS_CACHE_DEFINE()
 
-#define K4P_LINE_MAX 8192
 #define K4P_ERR_MAX 512
 
 /* ------------------------------------------------------------------------------ */
@@ -45,287 +41,54 @@ ZEND_TSRMLS_CACHE_DEFINE()
 static struct {
     int initialized;
     int shut_down;
+    pthread_t thread; /* the runtime thread, while initialized */
     char *ini_file;
     char *ini_entries;
     char *entrypoint;
-    k4p_log_fn log;
-    void *log_user_data;
 } k4p_rt;
+
+static int k4p_on_runtime_thread(void)
+{
+    return k4p_rt.initialized && pthread_equal(k4p_rt.thread, pthread_self());
+}
 
 /* ------------------------------------------------------------------------------ */
 /* Per-thread state. Plain C thread-local storage: no zval or other request memory  */
 /* is ever stored here, only malloc()ed copies.                                     */
 
-enum { K4P_RESULT_NONE = 0, K4P_RESULT_VALID, K4P_RESULT_INVALID };
+typedef enum k4p_phase {
+    K4P_PHASE_NONE = 0,  /* no interpreter globals on this thread */
+    K4P_PHASE_IDLE,      /* ready to execute a message */
+    K4P_PHASE_SCRIPT,    /* entrypoint + shutdown functions running: result() accepted */
+    K4P_PHASE_FINISHING, /* outcome determined; request shutting down */
+    K4P_PHASE_BROKEN     /* php_request_startup() failed: the thread is unusable */
+} k4p_phase;
 
 typedef struct k4p_thread_state {
-    int is_runtime_thread; /* called k4p_runtime_init() */
-    int thread_inited;     /* called k4p_thread_init() */
-    int broken;            /* php_request_startup() failed; thread is unusable */
+    k4p_phase phase;
+    const k4p_message *msg; /* during SCRIPT and FINISHING */
 
-    const k4p_message *msg; /* non-NULL from request startup until request shutdown */
-    int accepting_result;   /* result() allowed: script + shutdown functions */
-
-    int result_state;
-    k4p_outcome result;     /* when VALID */
-    char invalid[K4P_ERR_MAX]; /* when INVALID */
-    uint32_t invalid_handle;   /* object handle of the \ValueError thrown by result() */
-
-    int has_uncaught;
-    uint32_t uncaught_handle;
-    k4p_buf uncaught_class;
-    k4p_buf uncaught_message;
-
-    char *line; /* stdout line buffer, K4P_LINE_MAX bytes, lazily allocated */
-    size_t line_len;
+    /* What the request produced, each resolved when it happened:
+     *   result:   NO_RESULT until result() is called; then the converted result, or
+     *             INVALID_RESULT if the array was malformed.
+     *   uncaught: NO_RESULT unless an exception went uncaught; then
+     *             UNCAUGHT_EXCEPTION, or INVALID_RESULT if it was the \ValueError
+     *             result() threw. */
+    k4p_outcome result;
+    k4p_outcome uncaught;
+    uint32_t value_error_handle; /* the \ValueError result() threw; 0 = none */
 } k4p_thread_state;
 
 static __thread k4p_thread_state k4p_ts;
 
-/* ------------------------------------------------------------------------------ */
-/* Small helpers.                                                                   */
-
-static void k4p_log_raw(k4p_log_level level, const char *source, const char *msg, size_t len)
+static void k4p_request_state_reset(void)
 {
-    if (k4p_rt.log) {
-        k4p_rt.log(k4p_rt.log_user_data, level, source, (const uint8_t *)msg, len);
-    }
-}
-
-static void k4p_logf(k4p_log_level level, const char *fmt, ...)
-{
-    char buf[1024];
-    va_list ap;
-    int n;
-
-    va_start(ap, fmt);
-    n = vsnprintf(buf, sizeof(buf), fmt, ap);
-    va_end(ap);
-    if (n < 0) {
-        return;
-    }
-    k4p_log_raw(level, "sapi", buf, (size_t)n < sizeof(buf) ? (size_t)n : sizeof(buf) - 1);
-}
-
-static char *k4p_strdup(const char *s)
-{
-    char *d;
-    size_t n;
-
-    if (!s) {
-        return NULL;
-    }
-    n = strlen(s) + 1;
-    d = malloc(n);
-    if (d) {
-        memcpy(d, s, n);
-    }
-    return d;
-}
-
-static k4p_buf k4p_buf_null(void)
-{
-    k4p_buf b = {NULL, 0, 1};
-    return b;
-}
-
-/* malloc()ed copy of `len` bytes. Never returns a NULL `data` for a non-null buffer
- * (an empty buffer still gets a 1-byte allocation) so Rust can build slices safely. */
-static k4p_buf k4p_buf_copy(const char *data, size_t len)
-{
-    k4p_buf b;
-    uint8_t *p = malloc(len ? len : 1);
-
-    if (!p) {
-        /* Out of process memory: there is no sane way to continue. */
-        fprintf(stderr, "kafka4php: out of memory\n");
-        abort();
-    }
-    if (len) {
-        memcpy(p, data, len);
-    }
-    b.data = p;
-    b.len = len;
-    b.is_null = 0;
-    return b;
-}
-
-static k4p_buf k4p_buf_cstr(const char *s)
-{
-    return k4p_buf_copy(s, strlen(s));
-}
-
-static void k4p_buf_free(k4p_buf *b)
-{
-    free((void *)b->data);
-    b->data = NULL;
-    b->len = 0;
-    b->is_null = 1;
-}
-
-static void k4p_headers_free(k4p_header *h, size_t n)
-{
-    size_t i;
-
-    for (i = 0; i < n; i++) {
-        k4p_buf_free(&h[i].key);
-        k4p_buf_free(&h[i].value);
-    }
-    free(h);
-}
-
-void k4p_outcome_free(k4p_outcome *out)
-{
-    size_t i;
-
-    if (!out) {
-        return;
-    }
-    for (i = 0; i < out->messages_len; i++) {
-        k4p_outbound *m = &out->messages[i];
-        k4p_buf_free(&m->topic);
-        k4p_buf_free(&m->key);
-        k4p_buf_free(&m->value);
-        k4p_headers_free(m->headers, m->headers_len);
-    }
-    free(out->messages);
-    k4p_buf_free(&out->text);
-    k4p_buf_free(&out->class_name);
-    memset(out, 0, sizeof(*out));
-    out->kind = K4P_OUTCOME_NO_CONTENT;
-    out->text.is_null = 1;
-    out->class_name.is_null = 1;
-}
-
-static void k4p_outcome_init(k4p_outcome *out, k4p_outcome_kind kind)
-{
-    memset(out, 0, sizeof(*out));
-    out->kind = kind;
-    out->text = k4p_buf_null();
-    out->class_name = k4p_buf_null();
-}
-
-static void k4p_outcome_bootstrap(k4p_outcome *out, const char *why)
-{
-    k4p_outcome_init(out, K4P_OUTCOME_BOOTSTRAP);
-    out->text = k4p_buf_cstr(why);
-}
-
-/* Strict UTF-8 validation (no overlongs, no surrogates, max U+10FFFF). */
-static int k4p_utf8_valid(const unsigned char *s, size_t len)
-{
-    size_t i = 0;
-
-    while (i < len) {
-        unsigned char c = s[i];
-        size_t n;
-        uint32_t cp;
-
-        if (c < 0x80) {
-            i++;
-            continue;
-        } else if ((c & 0xE0) == 0xC0) {
-            n = 1;
-            cp = c & 0x1F;
-        } else if ((c & 0xF0) == 0xE0) {
-            n = 2;
-            cp = c & 0x0F;
-        } else if ((c & 0xF8) == 0xF0) {
-            n = 3;
-            cp = c & 0x07;
-        } else {
-            return 0;
-        }
-        if (len - i <= n) { /* truncated sequence */
-            return 0;
-        }
-        for (size_t k = 1; k <= n; k++) {
-            if ((s[i + k] & 0xC0) != 0x80) {
-                return 0;
-            }
-            cp = (cp << 6) | (s[i + k] & 0x3F);
-        }
-        if ((n == 1 && cp < 0x80) || (n == 2 && cp < 0x800) || (n == 3 && cp < 0x10000) ||
-            cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) {
-            return 0;
-        }
-        i += n + 1;
-    }
-    return 1;
-}
-
-/* ------------------------------------------------------------------------------ */
-/* Output: ub_write -> log callback, one call per line.                             */
-
-static void k4p_line_emit(void)
-{
-    size_t len = k4p_ts.line_len;
-
-    if (len && k4p_ts.line[len - 1] == '\r') {
-        len--;
-    }
-    if (len) {
-        k4p_log_raw(K4P_LOG_INFO, "stdout", k4p_ts.line, len);
-    }
-    k4p_ts.line_len = 0;
-}
-
-static void k4p_line_append(const char *s, size_t n)
-{
-    if (!k4p_ts.line) {
-        k4p_ts.line = malloc(K4P_LINE_MAX);
-        if (!k4p_ts.line) {
-            return;
-        }
-        k4p_ts.line_len = 0;
-    }
-    while (n) {
-        size_t take = K4P_LINE_MAX - k4p_ts.line_len;
-        if (take > n) {
-            take = n;
-        }
-        memcpy(k4p_ts.line + k4p_ts.line_len, s, take);
-        k4p_ts.line_len += take;
-        s += take;
-        n -= take;
-        if (k4p_ts.line_len == K4P_LINE_MAX) {
-            k4p_line_emit(); /* overlong line: emitted in chunks */
-        }
-    }
-}
-
-static void k4p_line_flush(void)
-{
-    if (k4p_ts.line && k4p_ts.line_len) {
-        k4p_line_emit();
-    }
-}
-
-static void k4p_line_release(void)
-{
-    k4p_line_flush();
-    free(k4p_ts.line);
-    k4p_ts.line = NULL;
-    k4p_ts.line_len = 0;
-}
-
-static size_t k4p_ub_write(const char *str, size_t len)
-{
-    const char *p = str;
-    size_t left = len;
-
-    while (left) {
-        const char *nl = memchr(p, '\n', left);
-        if (!nl) {
-            k4p_line_append(p, left);
-            break;
-        }
-        k4p_line_append(p, (size_t)(nl - p));
-        k4p_line_emit();
-        left -= (size_t)(nl - p) + 1;
-        p = nl + 1;
-    }
-    return len;
+    k4p_outcome_free(&k4p_ts.result);
+    k4p_outcome_free(&k4p_ts.uncaught);
+    k4p_outcome_init(&k4p_ts.result, K4P_OUTCOME_NO_RESULT);
+    k4p_outcome_init(&k4p_ts.uncaught, K4P_OUTCOME_NO_RESULT);
+    k4p_ts.value_error_handle = 0;
+    k4p_ts.msg = NULL;
 }
 
 /* ------------------------------------------------------------------------------ */
@@ -408,7 +171,7 @@ static sapi_module_struct k4p_sapi_module = {
     php_module_shutdown_wrapper,       /* shutdown */
     NULL,                              /* activate */
     NULL,                              /* deactivate */
-    k4p_ub_write,                      /* unbuffered write */
+    k4p_output_write,                  /* unbuffered write */
     k4p_sapi_flush,                    /* flush */
     NULL,                              /* get uid */
     NULL,                              /* getenv */
@@ -457,7 +220,6 @@ static ZEND_FUNCTION(k4p_native_message)
 {
     const k4p_message *m = k4p_ts.msg;
     zval headers;
-    size_t i;
 
     ZEND_PARSE_PARAMETERS_NONE();
 
@@ -483,7 +245,7 @@ static ZEND_FUNCTION(k4p_native_message)
     k4p_add_buf(return_value, "value", &m->value);
 
     array_init_size(&headers, (uint32_t)m->headers_len);
-    for (i = 0; i < m->headers_len; i++) {
+    for (size_t i = 0; i < m->headers_len; i++) {
         zval pair;
         array_init_size(&pair, 2);
         k4p_add_next_buf(&pair, &m->headers[i].key);
@@ -494,319 +256,44 @@ static ZEND_FUNCTION(k4p_native_message)
     add_assoc_long_ex(return_value, "attempt", sizeof("attempt") - 1, (zend_long)m->attempt);
 }
 
-/* --- result() validation + conversion into malloc()ed C structs ------------------ */
-
-typedef struct {
-    char *buf;
-    size_t cap;
-} k4p_err;
-
-static int k4p_fail(k4p_err *e, const char *fmt, ...)
-{
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(e->buf, e->cap, fmt, ap);
-    va_end(ap);
-    return FAILURE;
-}
-
-static zval *k4p_find(HashTable *ht, const char *key)
-{
-    zval *zv = zend_hash_str_find(ht, key, strlen(key));
-    if (zv) {
-        ZVAL_DEREF(zv);
-    }
-    return zv;
-}
-
-/* Rejects keys not in `allowed` (NULL-terminated). */
-static int k4p_check_keys(HashTable *ht, const char *const *allowed, const char *path, k4p_err *e)
-{
-    zend_string *key;
-    zend_ulong idx;
-
-    ZEND_HASH_FOREACH_KEY(ht, idx, key) {
-        const char *const *a;
-        int ok = 0;
-        if (key) {
-            for (a = allowed; *a; a++) {
-                if (zend_string_equals_cstr(key, *a, strlen(*a))) {
-                    ok = 1;
-                    break;
-                }
-            }
-        }
-        if (!ok) {
-            if (key) {
-                return k4p_fail(e, "%sunexpected key \"%s\"", path, ZSTR_VAL(key));
-            }
-            return k4p_fail(e, "%sunexpected key " ZEND_ULONG_FMT, path, idx);
-        }
-    } ZEND_HASH_FOREACH_END();
-    return SUCCESS;
-}
-
-/* `zv` may be NULL (missing). Required strings: missing or non-string fails. */
-static int k4p_req_string(zval *zv, const char *path, const char *name, k4p_buf *out, k4p_err *e)
-{
-    if (!zv || Z_TYPE_P(zv) != IS_STRING) {
-        return k4p_fail(e, "%s%s must be a string", path, name);
-    }
-    *out = k4p_buf_copy(Z_STRVAL_P(zv), Z_STRLEN_P(zv));
-    return SUCCESS;
-}
-
-/* Nullable strings: missing counts as null when `optional`. */
-static int k4p_nullable_string(zval *zv, int optional, const char *path, const char *name,
-                               k4p_buf *out, k4p_err *e)
-{
-    if (!zv) {
-        if (!optional) {
-            return k4p_fail(e, "%s%s is required (string or null)", path, name);
-        }
-        *out = k4p_buf_null();
-        return SUCCESS;
-    }
-    if (Z_TYPE_P(zv) == IS_NULL) {
-        *out = k4p_buf_null();
-        return SUCCESS;
-    }
-    if (Z_TYPE_P(zv) != IS_STRING) {
-        return k4p_fail(e, "%s%s must be a string or null", path, name);
-    }
-    *out = k4p_buf_copy(Z_STRVAL_P(zv), Z_STRLEN_P(zv));
-    return SUCCESS;
-}
-
-static int k4p_convert_headers(zval *zv, const char *path, k4p_header **out, size_t *out_len,
-                               k4p_err *e)
-{
-    HashTable *ht;
-    zval *pair;
-    size_t n, i = 0;
-
-    *out = NULL;
-    *out_len = 0;
-    if (!zv) {
-        return SUCCESS;
-    }
-    if (Z_TYPE_P(zv) != IS_ARRAY || !zend_array_is_list(Z_ARRVAL_P(zv))) {
-        return k4p_fail(e, "%sheaders must be a list of [name, value] pairs", path);
-    }
-    ht = Z_ARRVAL_P(zv);
-    n = zend_hash_num_elements(ht);
-    if (!n) {
-        return SUCCESS;
-    }
-    *out = calloc(n, sizeof(k4p_header));
-    if (!*out) {
-        return k4p_fail(e, "out of memory");
-    }
-    for (i = 0; i < n; i++) {
-        (*out)[i].key = k4p_buf_null();
-        (*out)[i].value = k4p_buf_null();
-    }
-    *out_len = n;
-
-    i = 0;
-    ZEND_HASH_FOREACH_VAL(ht, pair) {
-        zval *name, *value;
-        ZVAL_DEREF(pair);
-        if (Z_TYPE_P(pair) != IS_ARRAY || !zend_array_is_list(Z_ARRVAL_P(pair)) ||
-            zend_hash_num_elements(Z_ARRVAL_P(pair)) != 2) {
-            return k4p_fail(e, "%sheaders[%zu] must be a [name, value] pair", path, i);
-        }
-        name = zend_hash_index_find(Z_ARRVAL_P(pair), 0);
-        value = zend_hash_index_find(Z_ARRVAL_P(pair), 1);
-        ZVAL_DEREF(name);
-        ZVAL_DEREF(value);
-        if (Z_TYPE_P(name) != IS_STRING ||
-            !k4p_utf8_valid((const unsigned char *)Z_STRVAL_P(name), Z_STRLEN_P(name))) {
-            return k4p_fail(e, "%sheaders[%zu][0] (name) must be a valid UTF-8 string", path, i);
-        }
-        if (Z_TYPE_P(value) != IS_NULL && Z_TYPE_P(value) != IS_STRING) {
-            return k4p_fail(e, "%sheaders[%zu][1] (value) must be a string or null", path, i);
-        }
-        (*out)[i].key = k4p_buf_copy(Z_STRVAL_P(name), Z_STRLEN_P(name));
-        if (Z_TYPE_P(value) == IS_STRING) {
-            (*out)[i].value = k4p_buf_copy(Z_STRVAL_P(value), Z_STRLEN_P(value));
-        }
-        i++;
-    } ZEND_HASH_FOREACH_END();
-    return SUCCESS;
-}
-
-static int k4p_convert_outbound(zval *zv, size_t idx, k4p_outbound *m, k4p_err *e)
-{
-    static const char *const allowed[] = {"topic", "value", "key", "headers", "partition", NULL};
-    char path[64];
-    HashTable *ht;
-    zval *topic, *partition;
-
-    snprintf(path, sizeof(path), "messages[%zu].", idx);
-    ZVAL_DEREF(zv);
-    if (Z_TYPE_P(zv) != IS_ARRAY) {
-        return k4p_fail(e, "messages[%zu] must be an array", idx);
-    }
-    ht = Z_ARRVAL_P(zv);
-    if (k4p_check_keys(ht, allowed, path, e) != SUCCESS) {
-        return FAILURE;
-    }
-
-    topic = k4p_find(ht, "topic");
-    if (!topic || Z_TYPE_P(topic) != IS_STRING || Z_STRLEN_P(topic) == 0 ||
-        !k4p_utf8_valid((const unsigned char *)Z_STRVAL_P(topic), Z_STRLEN_P(topic))) {
-        return k4p_fail(e, "%stopic must be a non-empty valid UTF-8 string", path);
-    }
-    m->topic = k4p_buf_copy(Z_STRVAL_P(topic), Z_STRLEN_P(topic));
-
-    if (k4p_nullable_string(k4p_find(ht, "value"), 0, path, "value", &m->value, e) != SUCCESS ||
-        k4p_nullable_string(k4p_find(ht, "key"), 1, path, "key", &m->key, e) != SUCCESS ||
-        k4p_convert_headers(k4p_find(ht, "headers"), path, &m->headers, &m->headers_len, e) !=
-            SUCCESS) {
-        return FAILURE;
-    }
-
-    partition = k4p_find(ht, "partition");
-    if (partition && Z_TYPE_P(partition) != IS_NULL) {
-        if (Z_TYPE_P(partition) != IS_LONG || Z_LVAL_P(partition) < 0 ||
-            Z_LVAL_P(partition) > INT32_MAX) {
-            return k4p_fail(e, "%spartition must be null or an int between 0 and %d", path,
-                            INT32_MAX);
-        }
-        m->has_partition = 1;
-        m->partition = (int32_t)Z_LVAL_P(partition);
-    }
-    return SUCCESS;
-}
-
-/* On failure, `out` may be partially filled; the caller frees it. */
-static int k4p_convert_result(HashTable *ht, k4p_outcome *out, k4p_err *e)
-{
-    static const char *const keys_no_content[] = {"type", NULL};
-    static const char *const keys_content[] = {"type", "messages", NULL};
-    static const char *const keys_fail[] = {"type", "reason", "error_class", NULL};
-    static const char *const keys_retry[] = {"type", "reason", NULL};
-    zval *type = k4p_find(ht, "type");
-
-    if (!type || Z_TYPE_P(type) != IS_STRING) {
-        return k4p_fail(e, "type must be one of \"no_content\", \"content\", \"fail\", "
-                           "\"retry_later\"");
-    }
-
-    if (zend_string_equals_literal(Z_STR_P(type), "no_content")) {
-        k4p_outcome_init(out, K4P_OUTCOME_NO_CONTENT);
-        return k4p_check_keys(ht, keys_no_content, "", e);
-    }
-
-    if (zend_string_equals_literal(Z_STR_P(type), "content")) {
-        zval *messages, *m;
-        size_t n, i = 0;
-
-        k4p_outcome_init(out, K4P_OUTCOME_CONTENT);
-        if (k4p_check_keys(ht, keys_content, "", e) != SUCCESS) {
-            return FAILURE;
-        }
-        messages = k4p_find(ht, "messages");
-        if (!messages || Z_TYPE_P(messages) != IS_ARRAY ||
-            !zend_array_is_list(Z_ARRVAL_P(messages))) {
-            return k4p_fail(e, "messages must be a list of message arrays");
-        }
-        n = zend_hash_num_elements(Z_ARRVAL_P(messages));
-        if (n) {
-            out->messages = calloc(n, sizeof(k4p_outbound));
-            if (!out->messages) {
-                return k4p_fail(e, "out of memory");
-            }
-            for (i = 0; i < n; i++) {
-                out->messages[i].topic = k4p_buf_null();
-                out->messages[i].key = k4p_buf_null();
-                out->messages[i].value = k4p_buf_null();
-            }
-            out->messages_len = n;
-        }
-        i = 0;
-        ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(messages), m) {
-            if (k4p_convert_outbound(m, i, &out->messages[i], e) != SUCCESS) {
-                return FAILURE;
-            }
-            i++;
-        } ZEND_HASH_FOREACH_END();
-        return SUCCESS;
-    }
-
-    if (zend_string_equals_literal(Z_STR_P(type), "fail")) {
-        k4p_outcome_init(out, K4P_OUTCOME_FAIL);
-        if (k4p_check_keys(ht, keys_fail, "", e) != SUCCESS ||
-            k4p_req_string(k4p_find(ht, "reason"), "", "reason", &out->text, e) != SUCCESS ||
-            k4p_nullable_string(k4p_find(ht, "error_class"), 1, "", "error_class",
-                                &out->class_name, e) != SUCCESS) {
-            return FAILURE;
-        }
-        return SUCCESS;
-    }
-
-    if (zend_string_equals_literal(Z_STR_P(type), "retry_later")) {
-        k4p_outcome_init(out, K4P_OUTCOME_RETRY_LATER);
-        if (k4p_check_keys(ht, keys_retry, "", e) != SUCCESS ||
-            k4p_req_string(k4p_find(ht, "reason"), "", "reason", &out->text, e) != SUCCESS) {
-            return FAILURE;
-        }
-        return SUCCESS;
-    }
-
-    return k4p_fail(e, "type must be one of \"no_content\", \"content\", \"fail\", "
-                       "\"retry_later\"");
-}
-
-static void k4p_result_clear(void)
-{
-    if (k4p_ts.result_state == K4P_RESULT_VALID) {
-        k4p_outcome_free(&k4p_ts.result);
-    }
-    k4p_ts.result_state = K4P_RESULT_NONE;
-    k4p_ts.invalid[0] = '\0';
-    k4p_ts.invalid_handle = 0;
-}
-
 static ZEND_FUNCTION(k4p_native_result)
 {
     HashTable *ht;
     k4p_outcome res;
-    char errbuf[K4P_ERR_MAX];
-    k4p_err e = {errbuf, sizeof(errbuf)};
+    char err[K4P_ERR_MAX];
 
     ZEND_PARSE_PARAMETERS_START(1, 1)
         Z_PARAM_ARRAY_HT(ht)
     ZEND_PARSE_PARAMETERS_END();
 
-    if (!k4p_ts.accepting_result) {
+    switch (k4p_ts.phase) {
+    case K4P_PHASE_SCRIPT:
+        break;
+    case K4P_PHASE_FINISHING:
         zend_throw_exception(spl_ce_LogicException,
-                             k4p_ts.msg ? "Kafka4php\\Native\\result() called after the "
-                                          "request's outcome was determined"
-                                        : "Kafka4php\\Native\\result() called outside of a "
-                                          "kafka4php request",
+                             "Kafka4php\\Native\\result() called after the request's outcome "
+                             "was determined",
+                             0);
+        RETURN_THROWS();
+    default:
+        zend_throw_exception(spl_ce_LogicException,
+                             "Kafka4php\\Native\\result() called outside of a kafka4php request",
                              0);
         RETURN_THROWS();
     }
 
-    k4p_outcome_init(&res, K4P_OUTCOME_NO_CONTENT);
-    errbuf[0] = '\0';
-    if (k4p_convert_result(ht, &res, &e) != SUCCESS) {
-        k4p_outcome_free(&res);
-        k4p_result_clear();
-        k4p_ts.result_state = K4P_RESULT_INVALID;
-        snprintf(k4p_ts.invalid, sizeof(k4p_ts.invalid), "%s", errbuf);
-        zend_argument_value_error(1, "is not a valid result: %s", errbuf);
-        if (EG(exception)) {
-            k4p_ts.invalid_handle = EG(exception)->handle;
-        }
-        RETURN_THROWS();
+    k4p_outcome_free(&k4p_ts.result);
+    k4p_ts.value_error_handle = 0;
+    if (k4p_result_from_array(ht, &res, err, sizeof(err)) == SUCCESS) {
+        k4p_ts.result = res;
+        return;
     }
-
-    k4p_result_clear();
-    k4p_ts.result = res;
-    k4p_ts.result_state = K4P_RESULT_VALID;
+    k4p_outcome_with_text(&k4p_ts.result, K4P_OUTCOME_INVALID_RESULT, err);
+    zend_argument_value_error(1, "is not a valid result: %s", err);
+    if (EG(exception)) {
+        k4p_ts.value_error_handle = EG(exception)->handle;
+    }
+    RETURN_THROWS();
 }
 
 static const zend_function_entry k4p_native_functions[] = {
@@ -833,44 +320,39 @@ static zend_module_entry k4p_native_module = {
 /* ------------------------------------------------------------------------------ */
 /* Script execution.                                                                */
 
-static void k4p_uncaught_clear(void)
-{
-    if (k4p_ts.has_uncaught) {
-        k4p_buf_free(&k4p_ts.uncaught_class);
-        k4p_buf_free(&k4p_ts.uncaught_message);
-    }
-    k4p_ts.has_uncaught = 0;
-    k4p_ts.uncaught_handle = 0;
-}
-
-/* Records class + message of an exception about to be reported as uncaught. exit()
- * (unwind/graceful exit) is not an error; ParseError/CompileError are reported by
- * PHP as E_PARSE/E_COMPILE_ERROR and so classified as fatal errors. */
+/* Records an exception about to be reported as uncaught. exit() (unwind/graceful
+ * exit) is not an error; ParseError/CompileError are reported by PHP as
+ * E_PARSE/E_COMPILE_ERROR and so classified as fatal errors. */
 static void k4p_capture_uncaught(zend_object *ex)
 {
     zval rv, *message;
-    zend_class_entry *base;
 
     if (zend_is_unwind_exit(ex) || zend_is_graceful_exit(ex) ||
         instanceof_function(ex->ce, zend_ce_compile_error)) {
         return;
     }
-    k4p_uncaught_clear();
-    base = zend_get_exception_base(ex);
-    message = zend_read_property_ex(base, ex, ZSTR_KNOWN(ZEND_STR_MESSAGE), 1, &rv);
-    ZVAL_DEREF(message);
-    k4p_ts.uncaught_class = k4p_buf_copy(ZSTR_VAL(ex->ce->name), ZSTR_LEN(ex->ce->name));
-    if (message && Z_TYPE_P(message) == IS_STRING) {
-        k4p_ts.uncaught_message = k4p_buf_copy(Z_STRVAL_P(message), Z_STRLEN_P(message));
-    } else {
-        k4p_ts.uncaught_message = k4p_buf_copy("", 0);
+    k4p_outcome_free(&k4p_ts.uncaught);
+
+    if (k4p_ts.value_error_handle && ex->handle == k4p_ts.value_error_handle) {
+        /* The \ValueError result() threw: the result is invalid. */
+        k4p_outcome_init(&k4p_ts.uncaught, K4P_OUTCOME_INVALID_RESULT);
+        k4p_ts.uncaught.text = k4p_buf_copy((const char *)k4p_ts.result.text.data,
+                                            k4p_ts.result.text.len);
+        return;
     }
-    k4p_ts.uncaught_handle = ex->handle;
-    k4p_ts.has_uncaught = 1;
+
+    k4p_outcome_init(&k4p_ts.uncaught, K4P_OUTCOME_UNCAUGHT_EXCEPTION);
+    k4p_ts.uncaught.class_name = k4p_buf_copy(ZSTR_VAL(ex->ce->name), ZSTR_LEN(ex->ce->name));
+    message = zend_read_property_ex(zend_get_exception_base(ex), ex,
+                                    ZSTR_KNOWN(ZEND_STR_MESSAGE), 1, &rv);
+    ZVAL_DEREF(message);
+    k4p_ts.uncaught.text = message && Z_TYPE_P(message) == IS_STRING
+                               ? k4p_buf_copy(Z_STRVAL_P(message), Z_STRLEN_P(message))
+                               : k4p_buf_copy("", 0);
 }
 
 /* Mirrors zend_execute_script(), capturing the uncaught exception (if any) before it
- * is reported. */
+ * is reported. Re-check against Zend/zend.c on every PHP minor version. */
 static int k4p_execute_file(zend_file_handle *fh)
 {
     zend_op_array *op_array = zend_compile_file(fh, ZEND_REQUIRE);
@@ -900,7 +382,8 @@ static int k4p_execute_file(zend_file_handle *fh)
 }
 
 /* Mirrors php_execute_script_ex() (auto_prepend_file / auto_append_file, timeout),
- * minus chdir (SAPI_OPTION_NO_CHDIR, like the CLI and embed SAPIs). */
+ * minus chdir (SAPI_OPTION_NO_CHDIR, like the CLI and embed SAPIs). Re-check against
+ * main/main.c on every PHP minor version. */
 static void k4p_run_script(void)
 {
     zend_file_handle primary, prepend, append;
@@ -966,102 +449,39 @@ static void k4p_run_shutdown_functions(void)
     }
 }
 
-static void k4p_text_from_zstr(k4p_buf *b, zend_string *s)
+static void k4p_fatal_error(k4p_outcome *out)
 {
-    *b = s ? k4p_buf_copy(ZSTR_VAL(s), ZSTR_LEN(s)) : k4p_buf_copy("", 0);
+    smart_str s = {0};
+
+    smart_str_append(&s, PG(last_error_message));
+    if (PG(last_error_file)) {
+        smart_str_appends(&s, " in ");
+        smart_str_append(&s, PG(last_error_file));
+        smart_str_appends(&s, " on line ");
+        smart_str_append_long(&s, (zend_long)PG(last_error_lineno));
+    }
+    k4p_outcome_init(out, K4P_OUTCOME_FATAL_ERROR);
+    out->text = s.s ? k4p_buf_copy(ZSTR_VAL(s.s), ZSTR_LEN(s.s)) : k4p_buf_copy("", 0);
+    smart_str_free(&s);
 }
 
-/* DESIGN.md §5.3. */
+/* DESIGN.md §5.3. An uncaught exception is also reported as a fatal error, so it is
+ * checked first. */
 static void k4p_classify(k4p_outcome *out)
 {
     if (PG(connection_status) & PHP_CONNECTION_TIMEOUT) {
         k4p_outcome_init(out, K4P_OUTCOME_SOFT_TIMEOUT);
-        return;
+    } else if (k4p_ts.uncaught.kind != K4P_OUTCOME_NO_RESULT) {
+        k4p_outcome_move(out, &k4p_ts.uncaught);
+    } else if ((PG(last_error_type) & E_FATAL_ERRORS) && PG(last_error_message)) {
+        k4p_fatal_error(out);
+    } else {
+        k4p_outcome_move(out, &k4p_ts.result); /* NO_RESULT if result() was never called */
     }
-
-    if (k4p_ts.has_uncaught) {
-        if (k4p_ts.result_state == K4P_RESULT_INVALID &&
-            k4p_ts.uncaught_handle == k4p_ts.invalid_handle) {
-            /* the \ValueError thrown by result() itself */
-            k4p_outcome_init(out, K4P_OUTCOME_INVALID_RESULT);
-            out->text = k4p_buf_cstr(k4p_ts.invalid);
-            return;
-        }
-        k4p_outcome_init(out, K4P_OUTCOME_UNCAUGHT_EXCEPTION);
-        out->class_name = k4p_ts.uncaught_class;
-        out->text = k4p_ts.uncaught_message;
-        k4p_ts.uncaught_class = k4p_buf_null();
-        k4p_ts.uncaught_message = k4p_buf_null();
-        k4p_ts.has_uncaught = 0;
-        return;
-    }
-
-    if ((PG(last_error_type) & E_FATAL_ERRORS) && PG(last_error_message)) {
-        smart_str s = {0};
-        smart_str_append(&s, PG(last_error_message));
-        if (PG(last_error_file)) {
-            smart_str_appends(&s, " in ");
-            smart_str_append(&s, PG(last_error_file));
-            smart_str_appends(&s, " on line ");
-            smart_str_append_long(&s, (zend_long)PG(last_error_lineno));
-        }
-        smart_str_0(&s);
-        k4p_outcome_init(out, K4P_OUTCOME_FATAL_ERROR);
-        k4p_text_from_zstr(&out->text, s.s);
-        smart_str_free(&s);
-        return;
-    }
-
-    if (k4p_ts.result_state == K4P_RESULT_VALID) {
-        *out = k4p_ts.result; /* ownership moves to the caller */
-        k4p_outcome_init(&k4p_ts.result, K4P_OUTCOME_NO_CONTENT);
-        k4p_ts.result_state = K4P_RESULT_NONE;
-        return;
-    }
-
-    if (k4p_ts.result_state == K4P_RESULT_INVALID) {
-        k4p_outcome_init(out, K4P_OUTCOME_INVALID_RESULT);
-        out->text = k4p_buf_cstr(k4p_ts.invalid);
-        return;
-    }
-
-    k4p_outcome_init(out, K4P_OUTCOME_NO_RESULT);
 }
 
-static void k4p_request_state_reset(void)
+static void k4p_request_begin(const k4p_message *msg)
 {
-    k4p_result_clear();
-    k4p_uncaught_clear();
-    k4p_ts.accepting_result = 0;
-    k4p_ts.msg = NULL;
-}
-
-void k4p_execute(const k4p_message *msg, k4p_outcome *out)
-{
-    if (!out) {
-        return;
-    }
-    if (!msg) {
-        k4p_outcome_bootstrap(out, "k4p_execute: message is NULL");
-        return;
-    }
-    if (!k4p_rt.initialized) {
-        k4p_outcome_bootstrap(out, "PHP runtime is not initialized");
-        return;
-    }
-    if (!k4p_ts.is_runtime_thread && !k4p_ts.thread_inited) {
-        k4p_outcome_bootstrap(out, "k4p_thread_init() was not called on this thread");
-        return;
-    }
-    if (k4p_ts.broken) {
-        k4p_outcome_bootstrap(out, "PHP thread is unusable after a failed request startup");
-        return;
-    }
-    if (k4p_ts.msg) {
-        k4p_outcome_bootstrap(out, "k4p_execute: re-entrant call");
-        return;
-    }
-
     k4p_request_state_reset();
     k4p_ts.msg = msg;
 
@@ -1078,38 +498,67 @@ void k4p_execute(const k4p_message *msg, k4p_outcome *out)
     SG(request_info).argv = NULL;
     SG(headers_sent) = 0;
     SG(sapi_headers).http_response_code = 200;
+}
 
-    if (php_request_startup() == FAILURE) {
-        /* Like FPM and FrankenPHP: a failed request startup leaves the thread in an
-         * unknown state. Clean up what we can and refuse further work. */
-        k4p_ts.broken = 1;
-        zend_try {
-            php_request_shutdown(NULL);
-        } zend_end_try();
-        k4p_line_flush();
-        SG(server_context) = NULL;
-        SG(request_info).path_translated = NULL;
-        k4p_request_state_reset();
-        k4p_outcome_bootstrap(out, "php_request_startup() failed");
-        return;
-    }
-
-    /* sapi_activate() resets it: no headers, so header() after output doesn't warn. */
-    SG(request_info).no_headers = 1;
-
-    k4p_ts.accepting_result = 1;
-    k4p_run_script();
-    k4p_run_shutdown_functions();
-    k4p_ts.accepting_result = 0;
-
-    k4p_classify(out);
-
-    php_request_shutdown(NULL);
-    k4p_line_flush();
-
+/* After php_request_shutdown(), on every path. */
+static void k4p_request_end(k4p_phase next)
+{
+    k4p_output_flush();
     SG(server_context) = NULL;
     SG(request_info).path_translated = NULL;
     k4p_request_state_reset();
+    k4p_ts.phase = next;
+}
+
+void k4p_execute(const k4p_message *msg, k4p_outcome *out)
+{
+    if (!out) {
+        return;
+    }
+    if (!msg) {
+        k4p_outcome_with_text(out, K4P_OUTCOME_BOOTSTRAP, "k4p_execute: message is NULL");
+        return;
+    }
+    switch (k4p_ts.phase) {
+    case K4P_PHASE_IDLE:
+        break;
+    case K4P_PHASE_NONE:
+        k4p_outcome_with_text(out, K4P_OUTCOME_BOOTSTRAP,
+                              k4p_rt.initialized
+                                  ? "k4p_thread_init() was not called on this thread"
+                                  : "PHP runtime is not initialized");
+        return;
+    case K4P_PHASE_BROKEN:
+        k4p_outcome_with_text(out, K4P_OUTCOME_BOOTSTRAP,
+                              "PHP thread is unusable after a failed request startup");
+        return;
+    default:
+        k4p_outcome_with_text(out, K4P_OUTCOME_BOOTSTRAP, "k4p_execute: re-entrant call");
+        return;
+    }
+
+    k4p_request_begin(msg);
+    if (php_request_startup() == FAILURE) {
+        /* Like FPM and FrankenPHP: a failed request startup leaves the thread in an
+         * unknown state. Clean up what we can and refuse further work. */
+        zend_try {
+            php_request_shutdown(NULL);
+        } zend_end_try();
+        k4p_request_end(K4P_PHASE_BROKEN);
+        k4p_outcome_with_text(out, K4P_OUTCOME_BOOTSTRAP, "php_request_startup() failed");
+        return;
+    }
+    /* sapi_activate() resets it: no headers, so header() after output doesn't warn. */
+    SG(request_info).no_headers = 1;
+
+    k4p_ts.phase = K4P_PHASE_SCRIPT;
+    k4p_run_script();
+    k4p_run_shutdown_functions();
+    k4p_ts.phase = K4P_PHASE_FINISHING;
+
+    k4p_classify(out);
+    php_request_shutdown(NULL);
+    k4p_request_end(K4P_PHASE_IDLE);
 }
 
 /* ------------------------------------------------------------------------------ */
@@ -1137,8 +586,7 @@ int k4p_runtime_init(const k4p_runtime_config *config)
     k4p_rt.ini_file = k4p_strdup(config->ini_file);
     k4p_rt.ini_entries = k4p_strdup(config->ini_entries);
     k4p_rt.entrypoint = k4p_strdup(config->entrypoint);
-    k4p_rt.log = config->log;
-    k4p_rt.log_user_data = config->log_user_data;
+    k4p_log_init(config->log, config->log_user_data);
 
     php_tsrm_startup();
     ZEND_TSRMLS_CACHE_UPDATE();
@@ -1152,37 +600,36 @@ int k4p_runtime_init(const k4p_runtime_config *config)
     k4p_sapi_module.phpinfo_as_text = 1;
     k4p_sapi_module.ini_entries = k4p_rt.ini_entries;
 
-    k4p_ts.is_runtime_thread = 1;
-
     if (k4p_sapi_module.startup(&k4p_sapi_module) == FAILURE) {
         k4p_logf(K4P_LOG_ERROR, "PHP module startup failed");
         sapi_shutdown();
         tsrm_shutdown();
-        k4p_line_release();
+        k4p_output_release();
         k4p_rt_free();
-        k4p_ts.is_runtime_thread = 0;
         k4p_rt.shut_down = 1;
         return K4P_ERR_STARTUP;
     }
     SG(options) |= SAPI_OPTION_NO_CHDIR;
-    k4p_line_flush();
+    k4p_output_flush();
 
+    k4p_rt.thread = pthread_self();
     k4p_rt.initialized = 1;
+    k4p_ts.phase = K4P_PHASE_IDLE; /* the runtime thread has its interpreter globals */
     return K4P_OK;
 }
 
 int k4p_runtime_shutdown(void)
 {
-    if (!k4p_rt.initialized || !k4p_ts.is_runtime_thread) {
+    if (!k4p_on_runtime_thread()) {
         return K4P_ERR_STATE;
     }
     k4p_sapi_module.shutdown(&k4p_sapi_module);
     sapi_shutdown();
     tsrm_shutdown();
-    k4p_line_release();
+    k4p_output_release();
+    k4p_ts.phase = K4P_PHASE_NONE;
     k4p_rt.initialized = 0;
     k4p_rt.shut_down = 1;
-    k4p_ts.is_runtime_thread = 0;
     k4p_rt_free();
     k4p_sapi_module.ini_entries = NULL;
     k4p_sapi_module.php_ini_path_override = NULL;
@@ -1194,26 +641,31 @@ int k4p_thread_init(void)
     if (!k4p_rt.initialized) {
         return K4P_ERR_STATE;
     }
-    if (k4p_ts.is_runtime_thread || k4p_ts.thread_inited) {
-        return K4P_OK;
+    if (k4p_ts.phase != K4P_PHASE_NONE) {
+        return K4P_OK; /* idempotent; the runtime thread is always initialized */
     }
     (void)ts_resource(0);
     ZEND_TSRMLS_CACHE_UPDATE();
-    k4p_ts.thread_inited = 1;
-    k4p_ts.broken = 0;
+    k4p_ts.phase = K4P_PHASE_IDLE;
     return K4P_OK;
 }
 
 int k4p_thread_shutdown(void)
 {
-    if (k4p_ts.is_runtime_thread || !k4p_ts.thread_inited) {
+    switch (k4p_ts.phase) {
+    case K4P_PHASE_NONE:
         return K4P_OK;
-    }
-    if (k4p_ts.msg) {
+    case K4P_PHASE_SCRIPT:
+    case K4P_PHASE_FINISHING:
         return K4P_ERR_STATE;
+    default:
+        break;
+    }
+    if (k4p_on_runtime_thread()) {
+        return K4P_OK; /* its globals go with k4p_runtime_shutdown() */
     }
     ts_free_thread();
-    k4p_line_release();
-    k4p_ts.thread_inited = 0;
+    k4p_output_release();
+    k4p_ts.phase = K4P_PHASE_NONE;
     return K4P_OK;
 }

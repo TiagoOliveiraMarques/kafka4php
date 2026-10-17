@@ -11,6 +11,7 @@ links = "php"
 k4p-core.workspace = true
 
 [dev-dependencies]
+k4p-core = { workspace = true, features = ["testing"] }
 serde_json = "1"
 
 [build-dependencies]

@@ -5,13 +5,14 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{Case, LogRecord, fixtures, msg, take_logs};
+use common::{Case, LogRecord, fixtures, take_logs};
+use k4p_core::testing::inbound;
 use k4p_core::{ExecutionError, HandlerResult, InboundMessage, OutboundMessage, Outcome};
 use k4p_php_sys::{RuntimeConfig, execute, ffi::k4p_log_level};
 use serde_json::{Value, json};
 
 fn run_with_value(fixture: &str, value: &str) -> Outcome {
-    let mut m = msg(fixture);
+    let mut m = inbound(fixture, 0, 0);
     m.value = Some(value.as_bytes().to_vec());
     execute(&m)
 }
@@ -38,13 +39,16 @@ fn error_logs(logs: &[LogRecord]) -> Vec<String> {
 }
 
 fn no_content() {
-    assert_eq!(execute(&msg("no_content")), Ok(HandlerResult::NoContent));
+    assert_eq!(
+        execute(&inbound("no_content", 0, 0)),
+        Ok(HandlerResult::NoContent)
+    );
 }
 
 fn content_multiple_messages() {
     let h = |k: &str, v: Option<&str>| (k.to_owned(), v.map(|v| v.as_bytes().to_vec()));
     assert_eq!(
-        content(execute(&msg("content"))),
+        content(execute(&inbound("content", 0, 0))),
         vec![
             OutboundMessage {
                 topic: "out-a".into(),
@@ -93,7 +97,7 @@ fn fail_with_and_without_class() {
 
 fn retry_later() {
     assert_eq!(
-        execute(&msg("retry_later")),
+        execute(&inbound("retry_later", 0, 0)),
         Ok(HandlerResult::RetryLater {
             reason: "downstream unavailable".into()
         })
@@ -101,7 +105,10 @@ fn retry_later() {
 }
 
 fn no_result() {
-    assert_eq!(execute(&msg("no_result")), Err(ExecutionError::NoResult));
+    assert_eq!(
+        execute(&inbound("no_result", 0, 0)),
+        Err(ExecutionError::NoResult)
+    );
 }
 
 const INVALID_CASES: &[(&str, &str)] = &[
@@ -210,7 +217,7 @@ fn invalid_result_caught() {
 
 fn uncaught_exception() {
     assert_eq!(
-        execute(&msg("uncaught")),
+        execute(&inbound("uncaught", 0, 0)),
         Err(ExecutionError::UncaughtException {
             class: "App\\OrderFailed".into(),
             message: "db down: café".into(),
@@ -224,7 +231,7 @@ fn uncaught_exception() {
         "{errors:?}"
     );
 
-    match execute(&msg("uncaught_error")) {
+    match execute(&inbound("uncaught_error", 0, 0)) {
         Err(ExecutionError::UncaughtException { class, message }) => {
             assert_eq!(class, "Error");
             assert!(
@@ -238,7 +245,7 @@ fn uncaught_exception() {
 
 fn user_exception_handler_handles() {
     assert_eq!(
-        execute(&msg("exception_handler")),
+        execute(&inbound("exception_handler", 0, 0)),
         Ok(HandlerResult::Fail {
             reason: "handled: boom".into(),
             error_class: Some("DomainException".into()),
@@ -247,7 +254,7 @@ fn user_exception_handler_handles() {
 }
 
 fn fatal_error_memory_limit() {
-    match execute(&msg("fatal_memory")) {
+    match execute(&inbound("fatal_memory", 0, 0)) {
         Err(ExecutionError::FatalError(m)) => {
             assert!(
                 m.contains("Allowed memory size of 16777216 bytes exhausted"),
@@ -265,17 +272,20 @@ fn fatal_error_memory_limit() {
         "{logs:?}"
     );
     // memory_limit is per request: the next request has the default again.
-    assert_eq!(execute(&msg("no_content")), Ok(HandlerResult::NoContent));
+    assert_eq!(
+        execute(&inbound("no_content", 0, 0)),
+        Ok(HandlerResult::NoContent)
+    );
 }
 
 fn fatal_error_compile_and_parse() {
-    match execute(&msg("fatal_redeclare")) {
+    match execute(&inbound("fatal_redeclare", 0, 0)) {
         Err(ExecutionError::FatalError(m)) => {
             assert!(m.contains("Cannot redeclare"), "{m}")
         }
         other => panic!("expected FatalError, got {other:?}"),
     }
-    match execute(&msg("fatal_parse")) {
+    match execute(&inbound("fatal_parse", 0, 0)) {
         Err(ExecutionError::FatalError(m)) => {
             assert!(m.contains("syntax error"), "{m}");
             assert!(m.contains("parse_error.inc"), "{m}");
@@ -287,7 +297,7 @@ fn fatal_error_compile_and_parse() {
 fn soft_timeout() {
     let start = Instant::now();
     assert_eq!(
-        execute(&msg("soft_timeout")),
+        execute(&inbound("soft_timeout", 0, 0)),
         Err(ExecutionError::SoftTimeout)
     );
     let elapsed = start.elapsed();
@@ -303,28 +313,34 @@ fn soft_timeout() {
         "{errors:?}"
     );
     // The thread is fine afterwards, and the timer was reset.
-    assert_eq!(execute(&msg("no_content")), Ok(HandlerResult::NoContent));
     assert_eq!(
-        execute(&msg("soft_timeout")),
+        execute(&inbound("no_content", 0, 0)),
+        Ok(HandlerResult::NoContent)
+    );
+    assert_eq!(
+        execute(&inbound("soft_timeout", 0, 0)),
         Err(ExecutionError::SoftTimeout)
     );
-    assert!(execute(&msg("retry_later")).is_ok());
+    assert!(execute(&inbound("retry_later", 0, 0)).is_ok());
 }
 
 fn result_then_exit() {
     assert_eq!(
-        execute(&msg("result_then_exit")),
+        execute(&inbound("result_then_exit", 0, 0)),
         Ok(HandlerResult::RetryLater {
             reason: "set before exit".into()
         })
     );
     assert!(!take_logs().iter().any(|l| l.text().contains("unreachable")));
-    assert_eq!(execute(&msg("exit_only")), Err(ExecutionError::NoResult));
+    assert_eq!(
+        execute(&inbound("exit_only", 0, 0)),
+        Err(ExecutionError::NoResult)
+    );
 }
 
 fn shutdown_function_result_counts() {
     assert_eq!(
-        execute(&msg("shutdown_result")),
+        execute(&inbound("shutdown_result", 0, 0)),
         Ok(HandlerResult::RetryLater {
             reason: "from shutdown function for shutdown_result".into()
         })
@@ -333,7 +349,7 @@ fn shutdown_function_result_counts() {
 
 fn destructor_result_after_outcome() {
     assert_eq!(
-        execute(&msg("destructor_result")),
+        execute(&inbound("destructor_result", 0, 0)),
         Ok(HandlerResult::RetryLater {
             reason: "before destructors".into()
         })
@@ -404,7 +420,7 @@ fn binary_round_trip() {
 }
 
 fn null_and_empty_round_trip() {
-    let mut m = msg("echo_back");
+    let mut m = inbound("echo_back", 0, 0);
     m.key = None;
     m.value = Some(vec![]);
     let msgs = content(execute(&m));
@@ -419,7 +435,10 @@ fn null_and_empty_round_trip() {
 }
 
 fn output_and_errors_reach_log() {
-    assert_eq!(execute(&msg("logging")), Ok(HandlerResult::NoContent));
+    assert_eq!(
+        execute(&inbound("logging", 0, 0)),
+        Ok(HandlerResult::NoContent)
+    );
     let logs = take_logs();
     let stdout: Vec<(k4p_log_level, String)> = logs
         .iter()
@@ -472,7 +491,7 @@ fn output_and_errors_reach_log() {
 
 fn php_sapi_is_kafka4php() {
     assert_eq!(
-        json_value(execute(&msg("sapi_name"))),
+        json_value(execute(&inbound("sapi_name", 0, 0))),
         json!({
             "PHP_SAPI": "kafka4php",
             "php_sapi_name": "kafka4php",
@@ -503,18 +522,18 @@ fn request_isolation() {
         "error_handler_set": false,
     });
     for _ in 0..4 {
-        assert_eq!(json_value(execute(&msg("isolation"))), expected);
+        assert_eq!(json_value(execute(&inbound("isolation", 0, 0))), expected);
     }
 }
 
 fn headers_are_noops() {
-    assert_eq!(json_value(execute(&msg("headers"))), json!([]));
+    assert_eq!(json_value(execute(&inbound("headers", 0, 0))), json!([]));
     let logs = take_logs();
     assert!(error_logs(&logs).is_empty(), "{logs:?}");
 }
 
 fn execute_without_thread_init_is_bootstrap_error() {
-    let outcome = std::thread::spawn(|| execute(&msg("no_content")))
+    let outcome = std::thread::spawn(|| execute(&inbound("no_content", 0, 0)))
         .join()
         .unwrap();
     match outcome {
@@ -527,8 +546,8 @@ fn second_thread_init_and_shutdown() {
     // A fresh PHP thread works and can be torn down (S3 recycles threads this way).
     let outcome = std::thread::spawn(|| {
         assert!(k4p_php_sys::thread_init());
-        let a = execute(&msg("retry_later"));
-        let b = execute(&msg("no_content"));
+        let a = execute(&inbound("retry_later", 0, 0));
+        let b = execute(&inbound("no_content", 0, 0));
         assert!(k4p_php_sys::thread_shutdown());
         (a, b)
     })
