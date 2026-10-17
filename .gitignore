@@ -5,3 +5,4 @@ php/vendor/
 .vscode/
 *.swp
 .DS_Store
+.ci-cargo-home/

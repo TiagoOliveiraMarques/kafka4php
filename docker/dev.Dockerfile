@@ -2,6 +2,7 @@
 # tools. All builds and tests run inside it (DESIGN.md §8). Build context: repo root.
 #
 #   docker build -f docker/dev.Dockerfile --build-arg PHP_VERSION=8.4 -t kafka4php-dev:php8.4 .
+#   ... --build-arg PHP_DEBUG=1 -t kafka4php-dev:php8.4-debug .   # ZTS debug PHP, tests only
 #
 # Normally used through scripts/dev.sh / scripts/dev.ps1.
 
@@ -51,6 +52,12 @@ RUN set -eux; \
     rm -rf /tmp/rust-toolchain; \
     chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"; \
     rustc --version; cargo --version; cargo clippy --version; cargo fmt --version
+
+# Opt-in, tests only: PHP_DEBUG=1 rebuilds PHP from the same source as a ZTS debug
+# build (the k4p-php-sys leak check). Last, so both variants share every layer above.
+ARG PHP_DEBUG=0
+COPY docker/php-debug-build.sh /usr/local/bin/k4p-php-debug-build
+RUN if [ "$PHP_DEBUG" = 1 ]; then k4p-php-debug-build && k4p-php-check; fi
 
 WORKDIR /work
 CMD ["bash"]

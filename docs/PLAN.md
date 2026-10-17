@@ -27,7 +27,7 @@ build in which order**; DESIGN.md says **how the system works**.
 |---|---|---|---|---|
 | S0 | Workspace scaffold + `k4p-core` contract | — | done | Claude Code (Opus 5.5), 2026-10-10 |
 | S1 | Toolchain Docker image (ZTS + embed PHP, Rust) | — | done | Claude Code (Opus 5.5), 2026-10-10 |
-| S2 | C SAPI, single thread (`k4p-php-sys`) | S0, S1 | todo | |
+| S2 | C SAPI, single thread (`k4p-php-sys`) | S0, S1 | done | Claude Code sub-agent (Opus 5.5), 2026-10-10 |
 | S3 | PHP thread pool + timeouts + recycling (`k4p-php`) | S2 | todo | |
 | S4 | Opcache, preload & per-request cost under ZTS | S2 | todo | |
 | S5 | PHP userland framework (`php/`) | S0 | todo | |
@@ -162,13 +162,15 @@ cargo inside it from a Windows host.
   is **not rebuilt**: `docker/php-check.sh` verifies those and fails the image build
   if any is missing (review decision on PR #2: fail loudly rather than diverge from
   the base image).
-- **S2:** the dev image has no debug PHP. A ZTS debug build for the leak check
-  has to come from a separate, test-only Dockerfile, or the check is documented
-  as infeasible (as the S2 criteria allow).
+- **S2 (updated in S2's review):** a ZTS debug PHP is available as an opt-in variant
+  of the same image: `--build-arg PHP_DEBUG=1` / `PHP_DEBUG=1 scripts/dev.sh …`.
   Headers: `php-config --includes`; `sapi/embed/php_embed.h` is installed.
-- **CI:** `.github/workflows/build.yml` builds the image for PHP 8.4 and 8.5 on
-  every PR and push to `main` (GitHub Actions cache per version). It's green iff the
-  image builds, including the PHP checks. The full `scripts/ci.sh` is S9.
+- **CI:** `.github/workflows/build.yml`, on every PR and push to `main`, for PHP 8.4
+  and 8.5: `build and test` builds the image (GitHub Actions cache per version) and
+  runs `cargo fmt --check`, clippy `-D warnings` and `cargo test --workspace
+  --all-features` inside it; `leak check` runs `crates/k4p-php-sys/tests/leak-check.sh`
+  (added in S2). **New test suites must run in this workflow** (anything `cargo test`
+  picks up does automatically). The full `scripts/ci.sh` is S9.
 - **Files:** `docker/dev.Dockerfile` (+ `dev.Dockerfile.dockerignore`: the build
   context is only `rust-toolchain.toml` and `docker/php-check.sh`), `docker/php-check.sh`,
   `docker/compose.test.yml`, `scripts/dev.sh`, `scripts/dev.ps1`, `scripts/kafka-check.sh`,
@@ -253,7 +255,94 @@ outcome classification and no per-request memory growth. Highest-risk step.
 - No leaks reported by a ZTS **debug** PHP build for a 1,000-request run, or document
   why the check isn't feasible and what was done instead.
 
-**Handoff notes:** _(fill in when done — S3 and S4 depend heavily on these)_
+**Handoff notes:**
+- **Built** (`crates/k4p-php-sys/`): `csrc/k4p_sapi.h` (the C ABI, plain C types);
+  `csrc/k4p_sapi.c` (SAPI module `kafka4php`, native module/extension `kafka4php`
+  with `Kafka4php\Native\message()` / `result()`, per-thread phase + outcome slots,
+  script execution, classification, lifecycle), `csrc/k4p_result.c` (`result()`
+  validation/conversion), `csrc/k4p_output.c` (log sink, stdout lines),
+  `csrc/k4p_buf.c` (malloc'd buffers/outcomes, UTF-8), `csrc/k4p_internal.h`;
+  `build.rs` (php-config → `cc` on every `csrc/*.c` → link `libphp.so` → bindgen of
+  our header only); `src/lib.rs` (`ffi` bindings; public API `RuntimeConfig`,
+  `InitError`, `runtime_init`/`runtime_shutdown` (unsafe), `thread_init`,
+  `thread_shutdown`, `execute`; the C conversions are private), fixtures in
+  `tests/fixtures/`, tests `sapi`,
+  `memory`, `leaks`, and the debug-PHP leak check (`tests/leak-check.sh`, which runs
+  in the `PHP_DEBUG=1` variant of the toolchain image: `docker/php-debug-build.sh`).
+- **The final C ABI, thread-local design, INI handling and log callback contract are
+  in DESIGN.md §5.1.1**; validation rules in §5.2, classification in §5.3. Read
+  those rather than this summary.
+- **DESIGN.md changes (deviations/refinements, all in this commit):**
+  - §5.1: the entrypoint is not run through `php_execute_script()` but through a
+    mirror of it + `zend_execute_script()` (auto_prepend/append honoured, no chdir),
+    to capture the uncaught exception's class/message before PHP reports it.
+    `register_shutdown_function()` callbacks run before classification (their
+    `result()` counts); destructors at request end run after it (`result()` there
+    throws `\LogicException`).
+  - §5.3: soft timeout is detected with `PG(connection_status) &
+    PHP_CONNECTION_TIMEOUT`, because `EG(timed_out)` is reset before the fatal error
+    is raised. Uncaught `\ValueError` from `result()` itself → `InvalidResult` (not
+    `UncaughtException`). `\ParseError`/`\CompileError` → `FatalError` (that's how
+    PHP reports them). An exception handled by a user `set_exception_handler()` is
+    not uncaught.
+  - §5.2: strict validation (unknown keys rejected; `key` optional; topic and header
+    names must be valid UTF-8; partition `0..=2^31-1`).
+  - §5.1 SAPI properties: headers discarded, `header()` never warns; `$_SERVER` also
+    has `SCRIPT_FILENAME`/`SCRIPT_NAME`/`PHP_SELF`/`PATH_TRANSLATED`.
+  - §8 build.rs: `php-config --includes --prefix` only (no `--libs`), `$PHP_CONFIG`,
+    `links = "php"`, no rpath (ld cache). §9: fixture path and leak check.
+  - §5.1: **PHP 8.4 OPcache is inactive under SAPI name `kafka4php`.** Reviewed
+    and accepted as a limitation: no OPcache on 8.4, OPcache on 8.5, no workaround
+    (see S4's notes).
+- **Gotchas for S3:** see S3's *Notes from other steps*. Also: PHP can't be
+  restarted in a process, so every test binary that runs PHP must be its own
+  process with `harness = false` (`tests/common/mod.rs` is a reusable runner).
+  `k4p_runtime_init` is not thread-safe (guard it). The runtime thread may execute
+  messages itself, but don't: it is also the thread that must call
+  `runtime_shutdown`. Rust's runtime already ignores `SIGPIPE`; the SAPI doesn't
+  touch signal dispositions (no `signal(SIGPIPE, SIG_IGN)` like embed does).
+- **Gotchas for S4:** see S4's notes: no OPcache on 8.4 (accepted limitation); benchmark outside the `/work`
+  bind mount (an empty request costs ~0.05 ms from `/tmp`, ~5 ms from `/work` on
+  Docker Desktop for Windows); `opcache.file_update_protection`.
+- **Acceptance evidence** (both PHP 8.4.26 and 8.5.11, toolchain image):
+  - `cargo test -p k4p-php-sys --test sapi`: 23 cases pass — every outcome kind
+    (incl. 27 malformed-result shapes each → `InvalidResult` with the `\ValueError`
+    in the `error` log, caught `\ValueError` → `InvalidResult`, `memory_limit`
+    exhaustion / compile / parse errors → `FatalError`, `SoftTimeout` with
+    `max_execution_time=1` after ~1 s and the thread usable afterwards, result then
+    `exit()` → the result, `exit()` alone → `NoResult`), binary round trip (`\0`,
+    `0xff`, invalid UTF-8 in key/value/header values, offsets > 2^53) byte-identical
+    both ways (checked independently via PHP-side `bin2hex`), duplicate headers in
+    order, `echo`/`print` lines → `stdout`/INFO and warnings/notices/`error_log()` →
+    `error`/WARN (fatal → ERROR), `PHP_SAPI === 'kafka4php'`, isolation (globals,
+    constants, static vars/props, INI, output buffers, error handlers reset every
+    request), `execute` without `thread_init` → `Bootstrap`, a second thread
+    init/execute/shutdown.
+  - `memory` (100,000 requests, ≥ 1.84 MiB of userland data each — 10,000 strings
+    + 1,000 objects): RSS after warm-up (1,000 requests) and at every 10,000:
+    **8.4: 31,172 KiB (2nd run: 31,076 KiB) constant (+0.00%) at all 11 samples; 8.5: 34,236 KiB (2nd run: 34,260 KiB) constant
+    (+0.00%)**. `memory_get_usage()` at script start: 8.4 386,352 in every request;
+    8.5 413,464 in every request from the 2nd on (request 1: 415,744 — OPcache
+    compiles the script there). ~570 req/s (8.4, no OPcache) / ~670 req/s (8.5),
+    debug Rust build. The test asserts ±5% and identical start usage from request 2.
+  - **Leak check: no leaks.** `tests/leak-check.sh` builds a ZTS debug PHP
+    (`--enable-debug --enable-zend-test`) on top of the toolchain image and runs, on
+    it, the `leaks` test (1,000 requests over every fixture: Content 196, Fail 120,
+    FatalError 120, InvalidResult 120, NoContent 120, NoResult 80, RetryLater 160,
+    SoftTimeout 4, UncaughtException 80) and the whole `sapi` suite: zero leak
+    reports, all ZEND_ASSERTs hold. Positive control (`zend_leak_bytes(64)` from
+    `zend_test`) is reported (`… test.c(173) : Freeing 0x… (64 bytes), script=…`),
+    proving the reports are captured. Verified on 8.4 and 8.5 (both `leak-check: OK`).
+  - `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D
+    warnings` clean; `cargo test --workspace --all-features` passes on 8.4 and 8.5
+    (k4p-core tests included).
+- Test run times: `sapi` ~3 s, `leaks` ~10 s (soft timeouts), `memory` ~3 min.
+  `K4P_MEMORY_REQUESTS` shortens the memory test locally; `K4P_TEST_ECHO_LOG=1`
+  echoes PHP log lines; a substring argument filters cases
+  (`cargo test -p k4p-php-sys --test sapi -- soft`).
+- The debug image is test-only and S2's: `kafka4php-dev:php<ver>-debug`, built
+  `FROM kafka4php-dev:php<ver>` by `leak-check.sh` (5–10 min the first time); it
+  does not rely on `docker/dev.Dockerfile` build args.
 
 **Notes from other steps:** _(none yet)_
 
@@ -304,7 +393,20 @@ and a health signal. DESIGN.md §5.5.
 
 **Handoff notes:** _(fill in when done)_
 
-**Notes from other steps:** _(none yet)_
+**Notes from other steps:**
+- From S2: read S2's handoff notes first. In short: `k4p_php_sys::runtime_init` is
+  not thread-safe and PHP cannot be restarted in a process, so guard it with a
+  process-wide flag (and tests need `harness = false`, see
+  `crates/k4p-php-sys/tests/common/mod.rs`). A worker thread must call
+  `thread_init()` before and `thread_shutdown()` after its requests (recycling =
+  `thread_shutdown()` + exit; verified that a fresh thread works after another one
+  was shut down). `execute()` returning `Err(Bootstrap(..))` with "unusable" means
+  `php_request_startup()` failed: replace that thread. The log callback runs
+  synchronously on the PHP worker thread, so per-message context (consumer/topic/
+  partition/offset) can come from a Rust thread-local set around `execute()`.
+  Soft timeouts use per-thread `SIGRTMIN` timers (`timer_create` with
+  `SIGEV_THREAD_ID`): never block `SIGRTMIN` in PHP threads. A soft-timed-out request
+  is a normal `Err(SoftTimeout)` and the thread stays usable.
 
 ---
 
@@ -317,8 +419,9 @@ under ZTS, establish the default INI, and measure per-request overhead so we can
 make honest throughput claims.
 
 **Tasks**
-- Verify opcache is active for SAPI `kafka4php` (`opcache_get_status()` from a
-  fixture; hits increase across requests).
+- Verify opcache is active for SAPI `kafka4php` on PHP 8.5 (`opcache_get_status()`
+  from a fixture; hits increase across requests), and inactive on PHP 8.4 (accepted
+  limitation, DESIGN.md §5.1). Preload and JIT work is 8.5-only.
 - Verify `opcache.preload` (+ `opcache.preload_user` if needed) works in the
   embedded ZTS runtime: preloaded class available in requests without autoload.
   Fix the SAPI (in `k4p-php-sys`) if needed — coordinate via S2's notes if S3 is
@@ -344,7 +447,34 @@ make honest throughput claims.
 
 **Handoff notes:** _(fill in when done)_
 
-**Notes from other steps:** _(none yet)_
+**Notes from other steps:**
+- From S2: **benchmark from the container's own filesystem, not `/work`.** On Docker
+  Desktop for Windows the repo bind mount makes every `open()`/`stat()` cost
+  milliseconds: an empty request took ~5 ms with the entrypoint under `/work` and
+  ~0.05 ms (opcache on or off) from a copy in `/tmp`. Copy fixtures to a temp dir as
+  `crates/k4p-php-sys/tests/memory.rs` does.
+- From S2, **decided:** on **PHP 8.4 OPcache is inactive under our SAPI, and that
+  is an accepted limitation — do not work around it.** `ext/opcache/ZendAccelerator.c`
+  `accel_find_sapi()` (8.4.26) only enables OPcache for `apache`, `fastcgi`,
+  `cli-server`, `cgi-fcgi`, `fpm-fcgi`, `fpmi-fcgi`, `apache2handler`, `litespeed`,
+  `uwsgi`, `fuzzer`, `frankenphp`, `ngx-php` (and `cli`/`phpdbg` with
+  `enable_cli`). With `sapi_module.name = "kafka4php"` it is loaded
+  (`extension_loaded('Zend OPcache')`) but `opcache_get_status()` returns false. On
+  8.5 the list is gone and OPcache is active (hits increase per request). So for S4:
+  the opcache, preload and JIT tasks and tests apply to **PHP 8.5**. On 8.4, add a
+  test asserting OPcache is *inactive* (so a PHP change is noticed), and benchmark
+  8.4 without OPcache only. The default INI must not break 8.4. DESIGN.md §5.1
+  records the limitation.
+- From S2: on 8.5, `opcache.enable` defaults to 1 for the `kafka4php` SAPI (OPcache
+  is built in; 8.4 loads it via `conf.d/docker-php-ext-opcache.ini`). Note
+  `opcache.file_update_protection` (2 s): freshly written fixtures are not cached for
+  2 s; the memory test sets it to 0. The SAPI's own INI defaults and the INI
+  precedence are in DESIGN.md §5.1.1; S2 imposes nothing else (PHP defaults apply:
+  `max_execution_time=30`, `memory_limit=128M`). The `ini_defaults` hook in
+  `csrc/k4p_sapi.c` (`k4p_sapi_ini_defaults`) is the place for overridable
+  defaults if you want the default INI below user ini files.
+- From S2: `opcache.preload` runs during `php_module_startup()` on the runtime thread,
+  outside any request: `Kafka4php\Native\message()` throws `\LogicException` there.
 
 ---
 
@@ -548,7 +678,10 @@ covering DESIGN.md §9's E2E scenarios.
 
 **Handoff notes:** _(fill in when done)_
 
-**Notes from other steps:** _(none yet)_
+**Notes from other steps:**
+- From S2 (decision): no OPcache on PHP 8.4 under SAPI `kafka4php` (DESIGN.md §5.1). The
+  example app's preload script and any OPcache/preload E2E checks only apply to the 8.5
+  image; the 8.4 E2E run must not depend on OPcache.
 
 ---
 
@@ -578,4 +711,8 @@ building it).
 
 **Handoff notes:** _(fill in when done)_
 
-**Notes from other steps:** _(none yet)_
+**Notes from other steps:**
+- From S2 (decision): document in the PHP compatibility page (and the README) that
+  PHP 8.4 runs **without OPcache** (and so without preload / JIT) because PHP 8.4
+  only enables OPcache for a fixed list of SAPI names; PHP 8.5 has full OPcache.
+  Recommend the 8.5 image when performance matters. DESIGN.md §5.1.

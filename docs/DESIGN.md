@@ -227,26 +227,159 @@ PHP is built **ZTS** with `--enable-embed --enable-zend-max-execution-timers`.
 |---|---|---|
 | Runtime init | main thread, once, **before** worker threads | `php_tsrm_startup()`, `zend_signal_startup()` (if applicable), `sapi_startup(&k4p_sapi_module)`, set INI (file + overrides), `php_module_startup(&k4p_sapi_module, &k4p_native_module)`. Opcache initialises here; its shared memory is shared by all threads. |
 | Thread init | each worker thread | `ts_resource(0)` — allocates this thread's interpreter globals. |
-| Request | worker thread, per message | Set thread-local current message → `php_request_startup()` → `zend_try { php_execute_script(entrypoint) } zend_catch {} zend_end_try()` → classify outcome, copy result out of request memory → `php_request_shutdown()`. |
+| Request | worker thread, per message | Set thread-local current message → `php_request_startup()` → `zend_try { execute entrypoint } zend_catch {} zend_end_try()` → run `register_shutdown_function()` callbacks → classify outcome, copy result out of request memory → `php_request_shutdown()`. |
 | Thread shutdown | same worker thread | `ts_free_thread()`. |
 | Runtime shutdown | main thread, after all threads joined | `php_module_shutdown()`, `sapi_shutdown()`, `tsrm_shutdown()`. |
 
-Exact function names/signatures vary slightly across PHP versions — check the
-headers of the PHP version in `docker/dev.Dockerfile` and FrankenPHP's source.
+The same calls work unchanged on PHP 8.4 and 8.5 (verified against both headers).
+
+**Executing the entrypoint.** The SAPI does not call `php_execute_script()`: it
+mirrors it (honouring `auto_prepend_file` / `auto_append_file`, no `chdir`, like the
+CLI and embed SAPIs) and mirrors `zend_execute_script()`, so that it can record the
+class and message of an uncaught exception *before* PHP reports and discards it.
+User exception handlers (`set_exception_handler`) run first, exactly as in PHP; an
+exception they handle is not "uncaught". Then, still inside the request,
+`register_shutdown_function()` callbacks run (they would be the first thing
+`php_request_shutdown()` does): they are part of the script, so their `result()`
+counts. Destructors of objects alive at request end run in `php_request_shutdown()`,
+after classification. Because these two functions are copies of PHP internals,
+**re-check them against `main/main.c` and `Zend/zend.c` on every new PHP minor
+version** (the sapi test suite covers their observable behaviour).
+
+**Request info.** `SG(server_context)` points at the thread's state;
+`SG(request_info)`: no method/query/URI, `path_translated` = entrypoint,
+`no_headers = 1` (set after `php_request_startup()`, which resets it);
+`SAPI_OPTION_NO_CHDIR`. If `php_request_startup()` fails, the outcome is
+`Bootstrap` and the thread refuses all further work (like FPM/FrankenPHP treat it);
+the pool should replace it.
+
+#### 5.1.1 The C ABI (`crates/k4p-php-sys/csrc/k4p_sapi.h`)
+
+Plain C types only; bindgen sees only this header. All functions are C-callable from
+Rust through `k4p_php_sys::ffi`. The safe public API of `k4p_php_sys` is
+`RuntimeConfig`, `InitError`, `runtime_init` / `runtime_shutdown` (unsafe),
+`thread_init` / `thread_shutdown` and `execute(&InboundMessage) -> Outcome`; the C
+conversions behind `execute` are private. The C side is the authoritative validator
+of handler results: Rust trusts a filled outcome (non-UTF-8 topics or header names
+are only `debug_assert`ed) and treats an unknown outcome kind as a bug (`unreachable!`).
+
+Sources (`csrc/`): `k4p_sapi.h` (the ABI), `k4p_internal.h` (private declarations),
+`k4p_sapi.c` (SAPI + native module, request execution, classification, lifecycle),
+`k4p_result.c` (`result()` arrays → `k4p_outcome`, the only C code that knows the
+§5.2 shapes), `k4p_output.c` (log sink, stdout line buffering), `k4p_buf.c` (malloc'd
+buffers/outcomes, UTF-8 validation).
+
+```c
+typedef struct { const uint8_t *data; size_t len; uint8_t is_null; } k4p_buf; // bytes, NUL-safe
+typedef struct { k4p_buf key; k4p_buf value; } k4p_header;                   // key never null
+typedef struct { k4p_buf topic, delivery_topic; int32_t partition; int64_t offset;
+                 uint8_t has_timestamp; int64_t timestamp_ms; k4p_buf key, value;
+                 const k4p_header *headers; size_t headers_len; uint32_t attempt; } k4p_message;
+typedef struct { k4p_buf topic; uint8_t has_partition; int32_t partition; k4p_buf key, value;
+                 k4p_header *headers; size_t headers_len; } k4p_outbound;
+typedef enum { K4P_OUTCOME_NO_CONTENT = 0, K4P_OUTCOME_CONTENT = 1, K4P_OUTCOME_FAIL = 2,
+               K4P_OUTCOME_RETRY_LATER = 3, K4P_OUTCOME_NO_RESULT = 10,
+               K4P_OUTCOME_INVALID_RESULT = 11, K4P_OUTCOME_UNCAUGHT_EXCEPTION = 12,
+               K4P_OUTCOME_FATAL_ERROR = 13, K4P_OUTCOME_SOFT_TIMEOUT = 14,
+               K4P_OUTCOME_BOOTSTRAP = 15 } k4p_outcome_kind;
+typedef struct { k4p_outcome_kind kind; k4p_outbound *messages; size_t messages_len;
+                 k4p_buf text;          // reason / error message
+                 k4p_buf class_name;    // Fail.error_class / exception class
+               } k4p_outcome;
+typedef enum { K4P_LOG_ERROR = 1, K4P_LOG_WARN = 2, K4P_LOG_INFO = 3 } k4p_log_level;
+typedef void (*k4p_log_fn)(void *user_data, k4p_log_level level, const char *source,
+                           const uint8_t *msg, size_t len);
+typedef struct { const char *ini_file; const char *ini_entries; const char *entrypoint;
+                 k4p_log_fn log; void *log_user_data; } k4p_runtime_config;
+
+int  k4p_runtime_init(const k4p_runtime_config *);  // K4P_OK / _ERR_INVALID_ARGUMENT / _ERR_STATE / _ERR_STARTUP
+int  k4p_runtime_shutdown(void);
+int  k4p_thread_init(void);
+int  k4p_thread_shutdown(void);
+void k4p_execute(const k4p_message *msg, k4p_outcome *out); // always fills *out
+void k4p_outcome_free(k4p_outcome *out);
+```
+
+Contract:
+
+- `k4p_runtime_init` once per process; its thread becomes the **runtime thread**,
+  which may itself execute messages without `k4p_thread_init`. PHP cannot be
+  restarted: after `k4p_runtime_shutdown` (runtime thread only, after all PHP
+  threads called `k4p_thread_shutdown`), init returns `K4P_ERR_STATE`. All config
+  strings are copied.
+- Other threads: `k4p_thread_init` (idempotent) → any number of `k4p_execute`, one at
+  a time → `k4p_thread_shutdown` (refused during a request; no-op on the runtime
+  thread). `k4p_execute` on a thread without init, before runtime init, re-entrantly,
+  or on a broken thread yields `K4P_OUTCOME_BOOTSTRAP` instead of crashing.
+- `k4p_message` is borrowed for the duration of `k4p_execute` only. Every byte in
+  `k4p_outcome` is `malloc`ed by C and owned by the outcome until
+  `k4p_outcome_free` (idempotent). A non-null `k4p_buf` in an outcome never has a
+  NULL `data`. Topics and header names in `Content` are validated UTF-8; `text` and
+  `class_name` are not guaranteed UTF-8 (Rust converts them lossily).
+- **Thread-local state** (C `__thread`, never zvals): the thread's **phase**
+  (`NONE` → `IDLE` → `SCRIPT` (result() accepted) → `FINISHING` → `IDLE`, or
+  `BROKEN` after a failed request startup), which every entry point checks; the
+  current message; and two outcome slots, each resolved when it happens:
+  `result` (the converted `result()` array, or `INVALID_RESULT`) and `uncaught`
+  (`UNCAUGHT_EXCEPTION`, or `INVALID_RESULT` when the uncaught exception is the
+  `\ValueError` that `result()` threw). Classification is then a fixed order:
+  soft timeout → `uncaught` → fatal error → `result` (`NO_RESULT` if never set). The
+  runtime thread is identified by its `pthread_t`. The stdout line buffer is a
+  separate `__thread` in `k4p_output.c`. Sources are built with
+  `ZEND_ENABLE_STATIC_TSRMLS_CACHE`; `k4p_runtime_init` / `k4p_thread_init` run
+  `ZEND_TSRMLS_CACHE_UPDATE()`.
+
+**Log callback.** Called synchronously on the PHP thread that produced the output
+(during `k4p_execute`, or during init/shutdown on the runtime thread); it must be
+thread-safe, must not unwind and must not call back into the API. `msg` is not
+NUL-terminated, may be invalid UTF-8, and is only valid during the call. `source` is
+a static string:
+
+| source | what | level |
+|---|---|---|
+| `stdout` | script output (`echo`, `print`, `var_dump`, flushed output buffers): one call per line, line terminator (`\n` / `\r\n`) stripped, empty lines dropped, lines longer than 8 KiB split in 8 KiB chunks; a trailing partial line is flushed at request end | `INFO` |
+| `error` | PHP's error log via `log_message`: warnings, notices, deprecations, fatal errors, uncaught exceptions, `error_log()` — the PHP-formatted line, e.g. `PHP Warning:  … in /app/x.php on line 3` | `ERROR` for syslog level `LOG_ERR` or worse (fatal errors, uncaught exceptions, parse errors), else `WARN` |
+| `sapi` | diagnostics of the SAPI itself (e.g. module startup failed) | as given |
+
+If the user sets the `error_log` INI setting, PHP writes there instead and the
+callback does not see errors.
+
+**INI.** Precedence, lowest first: SAPI defaults (`ini_defaults`: `display_errors=0`,
+`log_errors=1`, `html_errors=0`, `register_argc_argv=0`, `output_buffering=0`) →
+`ini_file` (`php_ini_path_override`; NULL = PHP's normal search in
+`PHP_CONFIG_FILE_PATH`, never the cwd) → the scan dir (`conf.d`, always read: that's
+where `docker-php-ext-install` enables extensions, and where PHP 8.4 images load
+OPcache) → `ini_entries` (`key=value` lines, raw INI syntax — not quoted by the SAPI, highest).
+The C side imposes nothing else (PHP's own defaults apply, e.g.
+`max_execution_time=30`, `memory_limit=128M`); the host's default INI is S4's.
 
 SAPI module properties:
 
 - **name:** `"kafka4php"` (this is `PHP_SAPI`). Some libraries branch on
   `PHP_SAPI === 'cli'`; this is documented user-facing. Opcache reads
   `opcache.enable` (not `opcache.enable_cli`) for non-cli SAPIs.
+  **Limitation: no OPcache on PHP 8.4 (accepted, by decision).** PHP 8.4's OPcache
+  only activates for a hard-coded list of SAPI names (`accel_find_sapi()`:
+  apache2handler, fpm-fcgi, frankenphp, …), so under `kafka4php` it is loaded but
+  inactive (`opcache_get_status()` returns false): every message recompiles the
+  scripts it runs, and `opcache.preload` / the JIT are unavailable. We do **not**
+  work around it (e.g. by presenting another SAPI name to OPcache). PHP 8.5 dropped
+  the list, so OPcache, preload and the JIT work there. Users who need OPcache run
+  the PHP 8.5 image; this is documented user-facing.
 - **ub_write** (output: `echo`, `print`, `var_dump`): forwarded to the host log at
-  `info` with `stream=stdout`. Never part of the result.
-- **log_message**: forwarded to the host log (`warn` / `error` by PHP error level).
-- **send_headers / header_handler**: no-ops.
+  `info` with `stream=stdout` (log callback source `stdout`, line by line, §5.1.1).
+  Never part of the result.
+- **log_message**: forwarded to the host log (`warn` / `error` by PHP error level;
+  source `error`).
+- **send_headers / header_handler**: no-ops; headers are discarded (`headers_list()`
+  is always empty) and `header()` never warns about "headers already sent".
 - **SG(server_context)**: set to a non-NULL per-request pointer (some PHP code paths
   treat NULL as "no request").
-- `$_SERVER`: standard environment only. Message data is **not** passed via
-  superglobals — use the native functions.
+- `$_SERVER`: the process environment plus `SCRIPT_FILENAME`, `SCRIPT_NAME`,
+  `PHP_SELF`, `PATH_TRANSLATED` (= entrypoint) and PHP's `REQUEST_TIME[_FLOAT]`.
+  Message data is **not** passed via superglobals — use the native functions.
+- The native module is registered as extension **`kafka4php`**
+  (`extension_loaded('kafka4php') === true`).
 
 ### 5.2 Native PHP API (registered by the SAPI)
 
@@ -262,6 +395,13 @@ function message(): array;
 /** Set the result for the current request. Calling it again replaces the previous result. */
 function result(array $result): void;
 ```
+
+`message()` works anywhere during the request, including shutdown functions and
+destructors run at request end; it builds a fresh array on each call. `result()`
+works in the script and in shutdown functions; called after the outcome was
+determined (from a destructor run at request shutdown) or outside a request it
+throws `\LogicException`. A non-array argument is a `\TypeError` (an uncaught
+exception like any other).
 
 `message()` shape:
 
@@ -293,20 +433,41 @@ side validates and throws `\ValueError` immediately so the developer sees it):
 ['type' => 'retry_later', 'reason' => string]
 ```
 
+Validation is strict: unknown keys (at the top level and in each message) are
+rejected; `messages` and `headers` must be lists (`array_is_list`), each header an
+exact `[name, value]` pair; `topic` must be a non-empty valid UTF-8 string and header
+names valid UTF-8 (Rust `String`s); `value` is required (string or null), `key`,
+`headers`, `partition` and `error_class` are optional; `partition` must be an int in
+`0..=2^31-1` or null. The `\ValueError` message is
+`Kafka4php\Native\result(): Argument #1 ($result) is not a valid result: <what>`,
+and `<what>` (e.g. `messages[0].topic must be a non-empty valid UTF-8 string`) is the
+`InvalidResult` text.
+
 The C side converts the result into C structs allocated with `malloc` (not
-`emalloc`) **before** request shutdown, so it survives the request; Rust takes
+`emalloc`) at the moment `result()` is called — so it survives the request; Rust takes
 ownership and frees it via `k4p_outcome_free()`.
 
 ### 5.3 Outcome classification (C side)
 
-After the script runs, still inside the request:
+After the script and the shutdown functions ran, still inside the request:
 
-1. If `EG(timed_out)` (or equivalent for the PHP version) → `SoftTimeout`.
-2. Else if a fatal error occurred (`PG(last_error_type) & E_FATAL_ERRORS`): if it is
-   an uncaught exception → `UncaughtException{class,message}`; else
-   `FatalError(message)`.
-3. Else if `result()` was called → that result (even if `exit()` was called after it).
-4. Else → `NoResult`.
+1. If the soft timeout fired → `SoftTimeout`. Detected with
+   `PG(connection_status) & PHP_CONNECTION_TIMEOUT` (set by PHP's timeout handler),
+   because `EG(timed_out)` is already reset when the "Maximum execution time" fatal
+   error is raised (PHP 8.4 and 8.5).
+2. Else if an exception reached the top uncaught (and no user exception handler
+   handled it): if it is the `\ValueError` thrown by `result()` itself →
+   `InvalidResult(what)`; else `UncaughtException{class, message}` (class name and
+   `getMessage()` of the outermost exception). `exit()` is not an exception here;
+   `\ParseError` / `\CompileError` are reported by PHP as `E_PARSE` /
+   `E_COMPILE_ERROR`, so they land in 3.
+3. Else if a fatal error occurred (`PG(last_error_type) & E_FATAL_ERRORS`, incl.
+   `memory_limit` exhaustion, compile and parse errors) →
+   `FatalError("<message> in <file> on line <n>")`.
+4. Else if `result()` was called → the last result (even if `exit()` was called after
+   it). If the last call was invalid (the `\ValueError` was caught and no valid call
+   followed) → `InvalidResult(what)`.
+5. Else → `NoResult`.
 
 ### 5.4 Userland framework: `kafka4php/framework` (composer, in `php/`)
 
@@ -567,8 +728,13 @@ logged with `source=php`.
   based on `php:<ver>-zts-bookworm`. PHP must be ZTS + embed (`libphp.so`) + Zend
   max execution timers, with OPcache loaded. The official ZTS images ship exactly
   that (`--enable-embed --enable-zts`; timers default on with ZTS), so PHP is used
-  **as is** — never rebuilt. `docker/php-check.sh` runs first and **fails the
-  build** if any of these is missing. Plus the Rust toolchain pinned by
+  **as is** — never rebuilt to fix a missing feature. `docker/php-check.sh` runs
+  first and **fails the build** if any of these is missing. The one explicit,
+  test-only exception: `--build-arg PHP_DEBUG=1` (last layer,
+  `docker/php-debug-build.sh`) rebuilds the same PHP source with the same flags plus
+  `--enable-debug --enable-zend-test` for the leak check; `scripts/dev.sh` selects
+  it with `PHP_DEBUG=1` (image `kafka4php-dev:php<ver>-debug`, own `target/`
+  volume). Plus the Rust toolchain pinned by
   `rust-toolchain.toml`, cmake,
   clang/libclang (bindgen), pkg-config, OpenSSL/zstd/SASL headers, Composer.
   All builds and tests run inside it via `scripts/dev.sh` (Git Bash/Linux) or
@@ -581,9 +747,13 @@ logged with `source=php`.
   `scripts/dev.sh --with-kafka …` starts it, waits for health and attaches the
   container (env `K4P_KAFKA_BOOTSTRAP=kafka:9092`). `scripts/kafka-check.sh`
   smoke-tests it (create topic, produce, consume).
-- **`k4p-php-sys` build.rs**: runs `php-config --includes --prefix --libs`, compiles
-  `csrc/*.c` with the `cc` crate, links `libphp` dynamically, bindgens only
-  `csrc/k4p_sapi.h`.
+- **`k4p-php-sys` build.rs**: runs `php-config --includes --prefix` (`$PHP_CONFIG`
+  overrides the binary), compiles every `csrc/*.c` with the `cc` crate (C11,
+  `-Wall -Wextra -Werror`, `ZEND_ENABLE_STATIC_TSRMLS_CACHE=1`), links
+  `<prefix>/lib/libphp.so` dynamically (its own dependencies come with it; no
+  `--libs`), bindgens only `csrc/k4p_sapi.h`. No rpath: the loader finds
+  `/usr/local/lib/libphp.so` via the ld cache of the `php` images. The crate has
+  `links = "php"` and exports `DEP_PHP_LIB_DIR` to dependents' build scripts.
 - **rust-rdkafka** with the `cmake-build`, `ssl`, `zstd` features (librdkafka built
   statically from bundled source).
 - **Production image** (`docker/Dockerfile`), multi-stage: toolchain stage builds
@@ -600,7 +770,7 @@ logged with `source=php`.
   COPY kafka4php.toml /etc/kafka4php/kafka4php.toml
   ```
 
-- Supported PHP: 8.4 and 8.5 (CI matrix). Linux amd64 + arm64.
+- Supported PHP: 8.4 and 8.5 (CI matrix); 8.4 runs without OPcache (§5.1). Linux amd64 + arm64.
 
 ---
 
@@ -609,9 +779,10 @@ logged with `source=php`.
 | Layer | How |
 |---|---|
 | `k4p-core` | Unit tests. |
-| `k4p-php-sys` / `k4p-php` | Rust tests in the toolchain container running real PHP scripts from `crates/k4p-php/tests/fixtures/`: every outcome kind, binary-safe data round-trip, memory stability over ≥100k requests (RSS and `memory_get_usage` baseline stable), N-thread concurrency, recycling, soft and hard timeouts, abandoned-thread replacement. |
+| `k4p-php-sys` / `k4p-php` | Rust tests in the toolchain container running real PHP scripts (`crates/k4p-php-sys/tests/fixtures/`, `crates/k4p-php/tests/fixtures/`): every outcome kind, binary-safe data round-trip, memory stability over ≥100k requests (RSS and `memory_get_usage` baseline stable), N-thread concurrency, recycling, soft and hard timeouts, abandoned-thread replacement. PHP can be started once per process, so these test binaries use `harness = false` with their own runner (init on the main thread, cases on a PHP worker thread). `crates/k4p-php-sys/tests/leak-check.sh` re-runs the SAPI tests on a ZTS **debug** PHP (the `PHP_DEBUG=1` variant of the toolchain image) and fails on any reported request-memory leak, with a positive control. |
 | `k4p-host` | Unit tests with a `FakeExecutor` (scripted outcomes, delays). Integration tests against a real Kafka from `docker/compose.test.yml`: offsets, retry tiers & due-time, DLQ, max attempts, rebalance with in-flight messages, produce-failure blocking, backpressure. |
 | `php/` | PHPUnit + PHPStan (max level) using `FakeNativeBridge`. Runs on stock `php:8.x-cli`. |
+| CI | `.github/workflows/build.yml`, every PR and push to `main`, PHP 8.4 and 8.5: builds the toolchain image, runs `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace --all-features` in it, and the debug-PHP leak check. Every test suite must run there. |
 | E2E | `tests/e2e/`: production image + Kafka + `examples/basic`. Scenarios: happy path, `Content` produce, `Fail`→DLQ, retry→eventual success, max attempts→DLQ, uncaught exception, fatal error, soft/hard timeout, process crash (`posix_kill(getmypid(), SIGSEGV)`) then restart with static membership (no rebalance observed), graceful SIGTERM (no message lost or double-produced beyond at-least-once). |
 
 ---
