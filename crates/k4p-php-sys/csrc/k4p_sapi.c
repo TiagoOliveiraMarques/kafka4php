@@ -154,6 +154,20 @@ static void k4p_sapi_log_message(const char *message, int syslog_type_int)
     ZVAL_NEW_STR(&tmp, zend_string_init(value, sizeof(value) - 1, 1));                \
     zend_hash_str_update(configuration_hash, name, sizeof(name) - 1, &tmp);
 
+/* Every pcntl function of PHP 8.4 and 8.5: signals, fork and exec belong to the host
+ * (DESIGN.md §5.6). Disabling a function that isn't installed is a no-op. */
+#define K4P_DISABLED_PCNTL                                                           \
+    "pcntl_alarm,pcntl_async_signals,pcntl_errno,pcntl_exec,pcntl_fork,pcntl_forkx,"  \
+    "pcntl_get_last_error,pcntl_getcpu,pcntl_getcpuaffinity,pcntl_getpriority,"       \
+    "pcntl_getqos_class,pcntl_rfork,pcntl_setcpuaffinity,pcntl_setns,"               \
+    "pcntl_setpriority,pcntl_setqos_class,pcntl_signal,pcntl_signal_dispatch,"        \
+    "pcntl_signal_get_handler,pcntl_sigprocmask,pcntl_sigtimedwait,"                 \
+    "pcntl_sigwaitinfo,pcntl_strerror,pcntl_unshare,pcntl_wait,pcntl_waitid,"         \
+    "pcntl_waitpid,pcntl_wexitstatus,pcntl_wifcontinued,pcntl_wifexited,"             \
+    "pcntl_wifsignaled,pcntl_wifstopped,pcntl_wstopsig,pcntl_wtermsig"
+
+/* The host's default INI (DESIGN.md §5.1.2): what the SAPI needs, then the defaults
+ * for running handlers. */
 static void k4p_sapi_ini_defaults(HashTable *configuration_hash)
 {
     zval tmp;
@@ -162,6 +176,11 @@ static void k4p_sapi_ini_defaults(HashTable *configuration_hash)
     K4P_INI_DEFAULT("html_errors", "0");
     K4P_INI_DEFAULT("register_argc_argv", "0");
     K4P_INI_DEFAULT("output_buffering", "0");
+
+    K4P_INI_DEFAULT("memory_limit", "128M");
+    K4P_INI_DEFAULT("max_execution_time", "30");
+    K4P_INI_DEFAULT("disable_functions", K4P_DISABLED_PCNTL);
+    K4P_INI_DEFAULT("opcache.enable", "1");
 }
 
 static sapi_module_struct k4p_sapi_module = {

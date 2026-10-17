@@ -344,14 +344,56 @@ a static string:
 If the user sets the `error_log` INI setting, PHP writes there instead and the
 callback does not see errors.
 
-**INI.** Precedence, lowest first: SAPI defaults (`ini_defaults`: `display_errors=0`,
-`log_errors=1`, `html_errors=0`, `register_argc_argv=0`, `output_buffering=0`) →
-`ini_file` (`php_ini_path_override`; NULL = PHP's normal search in
+**INI.** Precedence, lowest first: the host's default INI (§5.1.2, the SAPI's
+`ini_defaults` hook) → `ini_file` (`php_ini_path_override`; NULL = PHP's normal search in
 `PHP_CONFIG_FILE_PATH`, never the cwd) → the scan dir (`conf.d`, always read: that's
 where `docker-php-ext-install` enables extensions, and where PHP 8.4 images load
 OPcache) → `ini_entries` (`key=value` lines, raw INI syntax — not quoted by the SAPI, highest).
-The C side imposes nothing else (PHP's own defaults apply, e.g.
-`max_execution_time=30`, `memory_limit=128M`); the host's default INI is S4's.
+Anything none of these set has PHP's built-in default.
+
+#### 5.1.2 Default INI
+
+Compiled into the SAPI (`k4p_sapi_ini_defaults()` in `csrc/k4p_sapi.c`), applied
+below every ini file and override. A user setting **replaces** a default (e.g. a
+`disable_functions` in php.ini replaces the whole list below, re-enabling `pcntl_*`).
+
+| Setting | Default | Why |
+|---|---|---|
+| `display_errors` | `0` | Output is not a response; errors go to the log (`log_errors`). |
+| `log_errors` | `1` | Errors reach the host log through `log_message` (§5.1.1). |
+| `html_errors` | `0` | Plain-text log lines. |
+| `register_argc_argv` | `0` | No argv: a request is not a CLI invocation. |
+| `output_buffering` | `0` | Output streams to the log line by line. |
+| `memory_limit` | `128M` | Per request (Zend MM). Worst-case PHP heap ≈ `threads` × `memory_limit`, plus OPcache shared memory. |
+| `max_execution_time` | `30` | The soft timeout (§5.5); keep it below `timeouts.hard`. |
+| `disable_functions` | every `pcntl_*` function (34, the 8.4/8.5 list) | Signals, fork and exec belong to the host (§5.6). Names of functions that aren't installed are ignored. |
+| `opcache.enable` | `1` | OPcache on (PHP 8.5; no effect on 8.4, see §5.1). |
+
+The official images ship no `php.ini` (only `php.ini-production` /
+`php.ini-development` templates, usable via `ini_file`), so everything else is PHP's
+built-in default. Notable OPcache defaults, deliberately left alone:
+
+- `opcache.validate_timestamps=1`, `opcache.revalidate_freq=2`: edited files are
+  picked up within 2 s, which keeps development with a mounted code dir working.
+  **Production recommendation: `opcache.validate_timestamps=0`** — the code in an
+  image never changes, and it skips the periodic `stat()` of every included file (a
+  small gain on a local filesystem, §5.7; larger on slow ones).
+- `opcache.jit=disable`. Opt in with `opcache.jit=tracing` (PHP 8.5; verified under
+  concurrent execution, §9). Handlers are usually I/O-bound, so the JIT rarely pays.
+- `opcache.memory_consumption=128` (MB, shared by all threads),
+  `opcache.file_update_protection=2` (files modified < 2 s ago are not cached).
+
+**Preloading** (`opcache.preload`, PHP 8.5): the preload script runs once, inside
+`php_module_startup()` on the runtime thread, before any worker thread starts; what it
+declares is visible in every request without autoloading. It runs outside a kafka4php
+request (`Kafka4php\Native\message()` throws `\LogicException`), its errors reach the
+host log, but its *output* goes straight to the process's stdout (OPcache swaps the
+SAPI's output callbacks while preloading). A failing preload script makes runtime init
+fail. When the process runs as **root**, OPcache requires `opcache.preload_user`: set it
+to `root`, which preloads in-process; any other user makes OPcache `fork()` a child to
+preload as that user, which is not supported in this multi-threaded host. As a
+non-root user (the production image), leave `opcache.preload_user` unset (OPcache warns
+that it is ignored).
 
 SAPI module properties:
 
@@ -364,8 +406,9 @@ SAPI module properties:
   inactive (`opcache_get_status()` returns false): every message recompiles the
   scripts it runs, and `opcache.preload` / the JIT are unavailable. We do **not**
   work around it (e.g. by presenting another SAPI name to OPcache). PHP 8.5 dropped
-  the list, so OPcache, preload and the JIT work there. Users who need OPcache run
-  the PHP 8.5 image; this is documented user-facing.
+  the list, so OPcache, preload and the JIT work there (§5.1.2, tested). Without
+  OPcache a typical entrypoint costs ~25× more per message (§5.7). Users who need
+  OPcache run the PHP 8.5 image; this is documented user-facing.
 - **ub_write** (output: `echo`, `print`, `var_dump`): forwarded to the host log at
   `info` with `stream=stdout` (log callback source `stdout`, line by line, §5.1.1).
   Never part of the result.
@@ -504,8 +547,9 @@ Kernel::run((new Router())
     ->on('payments', new App\PaymentHandler()));
 ```
 
-The entrypoint's bootstrap cost is paid on every message. Users keep it small;
-`opcache.preload` is the recommended lever.
+The entrypoint's bootstrap cost is paid on every message. Users keep it small. OPcache
+(PHP 8.5) is what makes it cheap; `opcache.preload` is the further lever, and pays more
+the more classes a message loads (§5.7).
 
 ### 5.5 Thread pool, timeouts, recycling (`k4p-php`)
 
@@ -580,6 +624,52 @@ Under ZTS these remain process-global and affect all threads: `setlocale()`,
 default INI disables `pcntl_signal`, `pcntl_fork`, `pcntl_exec` etc. via
 `disable_functions`). The Rust host owns all signal handling. Some PECL extensions
 wrap non-thread-safe C libraries; that's on the user.
+
+### 5.7 Performance characteristics
+
+Per-request cost of the SAPI on **one PHP thread**, sequential requests, measured by
+`cargo bench -p k4p-php-sys --bench request_cost` (median of 3 runs × 50,000 requests
+per row, after 1,000 warm-up requests; scripts on the container's own filesystem).
+Scenarios: `empty` = an entrypoint that only calls `result()` (the host + request
+lifecycle floor); `kernel` = a typical entrypoint: composer autoloader
+(`dump-autoload --optimize`), a stand-in for `Kernel::run` + `Router` (§5.4) and a
+trivial handler (decode a small JSON value, return `NoContent`), ~15 classes per
+request; `preload` = `kernel` with all app classes in `opcache.preload`. OPcache `on` =
+PHP defaults, `on-vt0` = plus `opcache.validate_timestamps=0`.
+
+| scenario | OPcache | req/s | mean µs | p50 µs | p99 µs |
+|---|---|---:|---:|---:|---:|
+| empty | off (8.4) | 16,163 | 61.9 | 52.9 | 203.8 |
+| empty | off (8.5) | 15,414 | 64.9 | 55.2 | 212.7 |
+| empty | on | 30,209 | 33.1 | 29.4 | 117.5 |
+| empty | on-vt0 | 31,301 | 31.9 | 24.9 | 106.6 |
+| kernel | off (8.4) | 474 | 2,111.1 | 1,981.0 | 3,718.1 |
+| kernel | off (8.5) | 485 | 2,061.8 | 1,942.9 | 3,580.2 |
+| kernel | on | 12,154 | 82.3 | 64.0 | 237.8 |
+| kernel | on-vt0 | 11,826 | 84.6 | 64.7 | 246.4 |
+| preload | on | 16,320 | 61.3 | 47.5 | 194.6 |
+| preload | on-vt0 | 15,744 | 63.5 | 54.0 | 212.4 |
+
+`on` rows are PHP 8.5.11 (8.4.26 has no OPcache under our SAPI, §5.1). Machine: Docker
+Desktop (WSL2) on a Windows 11 laptop, 16 vCPUs. **Absolute numbers on this machine
+vary by ~2.5× between sessions** (an earlier run the same day measured `empty`/on at
+~13 µs, `kernel`/on at ~35 µs and `kernel`/off at ~0.9 ms); the ratios below held in
+every run and are the claims to rely on:
+
+- **OPcache is the lever that matters.** Without it a typical entrypoint recompiles
+  every file it includes on every message: `kernel` is **~25× slower** than with
+  OPcache (≈ 0.5–1k msg/s per thread vs 12–30k). This is the cost of PHP 8.4 (§5.1).
+- The host + request lifecycle floor (`empty`, OPcache on) is tens of µs per message
+  (≈ 30–80k msg/s per thread); OPcache halves even that.
+- **Preload** saves ~25% over `kernel` with ~15 classes per message; it pays more the
+  more classes a message loads.
+- `validate_timestamps=0` is within run-to-run noise from a local filesystem (it saves
+  `stat()` calls, which matter on slow filesystems: on the Docker Desktop bind mount
+  an `empty` request costs ~5 ms, so never run code from a bind mount in production).
+- Real handlers are dominated by their own I/O (DB, HTTP); these numbers bound the
+  overhead kafka4php adds, per PHP thread. Throughput scales with `php.threads` up to
+  the cores available (§5.5; the JIT smoke test, a debug Rust build, ran 100k
+  requests on 4 threads at ~35k req/s on PHP 8.5).
 
 ---
 
@@ -824,7 +914,7 @@ logged with `source=php`.
 | Layer | How |
 |---|---|
 | `k4p-core` | Unit tests. |
-| `k4p-php-sys` / `k4p-php` | Rust tests in the toolchain container running real PHP scripts (`crates/k4p-php-sys/tests/fixtures/`, `crates/k4p-php/tests/fixtures/`): every outcome kind, binary-safe data round-trip, memory stability over ≥100k requests (RSS and `memory_get_usage` baseline stable), N-thread concurrency, recycling, soft and hard timeouts, abandoned-thread replacement. PHP can be started once per process, so these test binaries use `harness = false` with their own runner (init on the main thread, cases on a PHP worker thread). `crates/k4p-php-sys/tests/leak-check.sh` re-runs the SAPI tests on a ZTS **debug** PHP (the `PHP_DEBUG=1` variant of the toolchain image) and fails on any reported request-memory leak, with a positive control. |
+| `k4p-php-sys` / `k4p-php` | Rust tests in the toolchain container running real PHP scripts (`crates/k4p-php-sys/tests/fixtures/`, `crates/k4p-php/tests/fixtures/`): every outcome kind, binary-safe data round-trip, memory stability over ≥100k requests (RSS and `memory_get_usage` baseline stable), N-thread concurrency, recycling, soft and hard timeouts, abandoned-thread replacement. PHP can be started once per process, so these test binaries use `harness = false` with their own runner (init on the main thread, cases on a PHP worker thread). `crates/k4p-php-sys/tests/leak-check.sh` re-runs the SAPI tests on a ZTS **debug** PHP (the `PHP_DEBUG=1` variant of the toolchain image) and fails on any reported request-memory leak, with a positive control. `k4p-php-sys` tests `opcache` (8.5: OPcache active, preloaded class/function visible without autoload, tracing JIT on and ≥ 100k requests on 4 threads; 8.4: OPcache loaded but inactive, so a PHP change is noticed) and `default_ini` (§5.1.2 values and precedence). The benchmark `cargo bench -p k4p-php-sys --bench request_cost` produces the §5.7 table. |
 | `k4p-host` | Unit tests with a `FakeExecutor` (scripted outcomes, delays). Integration tests against a real Kafka from `docker/compose.test.yml`: offsets, retry tiers & due-time, DLQ, max attempts, rebalance with in-flight messages, produce-failure blocking, backpressure. |
 | `php/` | PHPUnit + PHPStan (max level) using `FakeNativeBridge`. Runs on stock `php:8.x-cli`. |
 | CI | `.github/workflows/build.yml`, every PR and push to `main`, PHP 8.4 and 8.5: builds the toolchain image, runs `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace --all-features` in it, and the debug-PHP leak check. Every test suite must run there. |
