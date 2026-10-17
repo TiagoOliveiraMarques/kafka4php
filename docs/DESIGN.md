@@ -225,11 +225,11 @@ PHP is built **ZTS** with `--enable-embed --enable-zend-max-execution-timers`.
 
 | Phase | Where | What happens |
 |---|---|---|
-| Runtime init | main thread, once, **before** worker threads | `php_tsrm_startup()`, `zend_signal_startup()` (if applicable), `sapi_startup(&k4p_sapi_module)`, set INI (file + overrides), `php_module_startup(&k4p_sapi_module, &k4p_native_module)`. Opcache initialises here; its shared memory is shared by all threads. |
+| Runtime init | the runtime thread (`k4p-php`: `php-runtime`, §5.5), once, **before** worker threads | `php_tsrm_startup()`, `zend_signal_startup()` (if applicable), `sapi_startup(&k4p_sapi_module)`, set INI (file + overrides), `php_module_startup(&k4p_sapi_module, &k4p_native_module)`. Opcache initialises here; its shared memory is shared by all threads. |
 | Thread init | each worker thread | `ts_resource(0)` — allocates this thread's interpreter globals. |
 | Request | worker thread, per message | Set thread-local current message → `php_request_startup()` → `zend_try { execute entrypoint } zend_catch {} zend_end_try()` → run `register_shutdown_function()` callbacks → classify outcome, copy result out of request memory → `php_request_shutdown()`. |
 | Thread shutdown | same worker thread | `ts_free_thread()`. |
-| Runtime shutdown | main thread, after all threads joined | `php_module_shutdown()`, `sapi_shutdown()`, `tsrm_shutdown()`. |
+| Runtime shutdown | the runtime thread, after all threads joined | `php_module_shutdown()`, `sapi_shutdown()`, `tsrm_shutdown()`. |
 
 The same calls work unchanged on PHP 8.4 and 8.5 (verified against both headers).
 
@@ -509,23 +509,66 @@ The entrypoint's bootstrap cost is paid on every message. Users keep it small;
 
 ### 5.5 Thread pool, timeouts, recycling (`k4p-php`)
 
-- Fixed pool of `php.threads` dedicated `std::thread`s (never tokio threads). Each
-  thread receives work through a channel and replies via a oneshot. **No zval ever
-  crosses threads:** messages go in as owned bytes, results come out as owned Rust
-  structs.
+API: `PhpPool::start(PhpConfig, impl LogSink) -> Result<PhpPool, StartError>`
+(once per process; a second call is `AlreadyStarted`), `impl Executor for PhpPool`,
+`health() -> PoolHealth`, `health_watch() -> tokio::sync::watch::Receiver<PoolHealth>`,
+`shutdown(grace) -> ShutdownReport`. `PhpConfig` = entrypoint, ini file, INI entries
+(`key=value` lines), `threads`, `max_requests_per_thread`, `hard_timeout`,
+`max_abandoned_threads` (counts are `NonZero*`, `hard_timeout` must be > 0).
+
+- **Threads.** A dedicated **runtime thread** (`php-runtime`) runs
+  `k4p_runtime_init`, spawns the PHP threads, then **supervises** (watchdog,
+  replacements, joining exited threads) until shutdown, and finally runs
+  `k4p_runtime_shutdown`. It never executes a message; `start` and `shutdown` may be
+  called from any thread. `php.threads` dedicated **PHP threads** (`php-<n>`, never
+  tokio threads) each `k4p_thread_init`, run requests one at a time, then
+  `k4p_thread_shutdown` and exit. **No zval ever crosses threads:** messages go in as
+  owned bytes, results come out as owned Rust structs (a oneshot per message).
+- **Queue.** `execute` appends the message to one FIFO queue shared by all PHP
+  threads; it never fails while the pool runs. **Calling `execute` more than
+  `capacity()` times concurrently is allowed: the extra messages wait in the queue**
+  (the dispatcher normally never does it). The hard timeout starts when a thread
+  picks the message up. Dropping an execute future does not stop a running request;
+  a queued message whose future was dropped is skipped. `capacity()` = `php.threads`,
+  constant across replacements.
 - **Soft timeout:** PHP's `max_execution_time` (per-thread timers, requires
-  `--enable-zend-max-execution-timers`). Produces `SoftTimeout`.
-- **Hard timeout:** a watchdog in the pool. If a request exceeds `timeouts.hard`,
-  the execute future resolves with `HardTimeout` immediately, the thread is marked
-  **abandoned** (a thread cannot be safely killed), and a replacement thread is
-  spawned so capacity is preserved. If the abandoned thread ever returns, its result
-  is discarded and the thread exits.
-- When abandoned threads ≥ `timeouts.max_abandoned_threads`, the pool reports
-  `unhealthy`, and the binary performs a graceful process restart (§7.3).
-- **Recycling:** after `php.max_requests_per_thread` requests, a thread finishes its
-  current request, calls `ts_free_thread()`, exits, and is replaced by a fresh
-  thread. Handles per-thread leaks. Process-wide extension leaks are handled by
-  process restarts (cheap thanks to static membership).
+  `--enable-zend-max-execution-timers`). Produces `SoftTimeout`; the thread stays.
+- **Hard timeout:** the runtime thread's watchdog. If a request exceeds
+  `timeouts.hard`, its execute future resolves with `HardTimeout` immediately, the
+  thread is marked **abandoned** (a thread cannot be safely killed), and a
+  replacement thread is spawned so capacity is preserved. The future resolves only
+  after the replacement was spawned and `health()` reflects the abandonment. This
+  does not depend on the future being polled. If the abandoned thread ever returns, its result is discarded
+  and it calls `k4p_thread_shutdown` and exits.
+- **Health** (`PoolHealth`): `live_threads`, `abandoned` (abandoned threads still
+  stuck), `abandoned_total`, `recycled_total`, `unhealthy`. The pool is **unhealthy**
+  once `abandoned_total ≥ timeouts.max_abandoned_threads` (over the pool's lifetime,
+  whether or not those threads came back) or a replacement thread could not be
+  spawned. Unhealthy is sticky; the pool keeps executing, and the binary performs a
+  graceful process restart (§7.3), e.g. awaiting `health_watch().wait_for(|h| h.unhealthy)`.
+- **Recycling:** after `php.max_requests_per_thread` requests, a thread answers its
+  last request, calls `k4p_thread_shutdown()` (`ts_free_thread()`), exits, and is
+  replaced by a fresh thread; queued messages wait for it, none is dropped. Handles
+  per-thread leaks. Process-wide extension leaks are handled by process restarts
+  (cheap thanks to static membership). A thread whose request could not start
+  (`Bootstrap`, §5.1) is replaced the same way.
+- **Shutdown** (`shutdown(grace)`, blocking; idempotent, later calls return the first
+  report): `execute` answers `Bootstrap("PHP pool is shut down")` from then on;
+  queued and in-flight messages may finish within `grace`; then still-running
+  requests are answered `HardTimeout` and their threads abandoned, and still-queued
+  messages are answered `Bootstrap`. The runtime thread joins every exited PHP thread
+  and shuts PHP down — **unless an abandoned thread may still be running PHP: then
+  PHP is left running** (`ShutdownReport::runtime_shut_down == false`), since the
+  process is about to exit anyway. Dropping a `PhpPool` without `shutdown` leaves
+  its threads running.
+- **Logging.** The `LogSink` (one per process) receives every log callback line
+  (§5.1.1) as a `LogRecord { level, source, message, context }`; `context` is the
+  message being executed on that PHP thread (`topic`, `delivery_topic`, `partition`,
+  `offset`, `attempt`; `None` during runtime init/shutdown), from a thread-local set
+  around each request. `TracingLogSink` forwards to `tracing` (target `php`, fields
+  `source = "php"`, `stream`, and the context). Sink panics are swallowed. Pool
+  events (abandoned thread with its message's coordinates, replacements, spawn
+  failures) are logged with `tracing` directly.
 - `memory_limit` is enforced per request by the Zend memory manager.
 
 ### 5.6 Process-wide state hazards (document for users)

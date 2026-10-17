@@ -28,7 +28,7 @@ build in which order**; DESIGN.md says **how the system works**.
 | S0 | Workspace scaffold + `k4p-core` contract | — | done | Claude Code (Opus 5.5), 2026-10-10 |
 | S1 | Toolchain Docker image (ZTS + embed PHP, Rust) | — | done | Claude Code (Opus 5.5), 2026-10-10 |
 | S2 | C SAPI, single thread (`k4p-php-sys`) | S0, S1 | done | Claude Code sub-agent (Opus 5.5), 2026-10-10 |
-| S3 | PHP thread pool + timeouts + recycling (`k4p-php`) | S2 | in-progress | Claude Code (Opus 5.5), 2026-10-17 |
+| S3 | PHP thread pool + timeouts + recycling (`k4p-php`) | S2 | done | Claude Code (Opus 5.5), 2026-10-17 |
 | S4 | Opcache, preload & per-request cost under ZTS | S2 | todo | |
 | S5 | PHP userland framework (`php/`) | S0 | todo | |
 | S6 | Kafka consumer engine + dispatcher (`k4p-host`) | S0, S1 | todo | |
@@ -391,7 +391,71 @@ and a health signal. DESIGN.md §5.5.
   behaviour (queue or error — pick one, document it in DESIGN.md §5.5).
 - Graceful shutdown with in-flight requests completes them within grace.
 
-**Handoff notes:** _(fill in when done)_
+**Handoff notes:**
+- **Built** (`crates/k4p-php/`): `PhpPool` (`src/pool.rs`: `start`, `impl Executor`,
+  `health`, `health_watch`, `shutdown`), `PhpConfig`/`StartError` (`src/config.rs`),
+  `LogSink`/`LogRecord`/`MessageContext`/`TracingLogSink` + the C log callback
+  (`src/log.rs`), shared state and job queue (`src/state.rs`), the runtime thread's
+  supervisor/watchdog (`src/supervisor.rs`), the PHP worker loop (`src/worker.rs`).
+  Tests: `tests/pool.rs`, `tests/hard_timeout.rs`, `tests/recycling.rs` (each its own
+  process, `harness = false`, runner in `tests/common/mod.rs`, fixtures in
+  `tests/fixtures/`, copied to a temp dir like S2's memory test).
+- **The as-built behaviour is DESIGN.md §5.5** (rewritten in this change); read it
+  rather than this summary.
+- **Deviations from this plan's proposed API (all in DESIGN.md):**
+  - `PhpPool::start(PhpConfig, impl LogSink)` instead of `PhpRuntime::start`; PHP is
+    initialised on a **dedicated runtime thread** (`php-runtime`), not the calling
+    thread. That thread also runs the watchdog and is the one that calls
+    `runtime_shutdown`, so `start`/`shutdown` may be called from any thread (no
+    "same thread as init" constraint for S8 under tokio). §5.1's lifecycle table
+    now says "runtime thread" instead of "main thread".
+  - Beyond-capacity `execute` calls **queue** (FIFO); the hard timeout starts when a
+    thread picks the message up.
+  - The watchdog runs on the runtime thread, independent of the execute future being
+    polled (a dropped future cannot leak capacity). Queued messages whose future was
+    dropped are skipped.
+  - `unhealthy` = `abandoned_total ≥ max_abandoned_threads` (lifetime count, sticky)
+    or a failed thread spawn. `PoolHealth` also has `abandoned` (still stuck) and
+    `recycled_total`.
+  - `shutdown(grace)` is **blocking** (S8: `spawn_blocking`) and idempotent; it
+    returns `ShutdownReport { abandoned_at_shutdown, abandoned_threads,
+    runtime_shut_down }`. While closing, every request's deadline is cut to the end
+    of the grace period, so the watchdog enforces grace and hard timeout alike.
+  - A thread whose request returned `Bootstrap` (failed `php_request_startup`) is
+    replaced. This path is not covered by a test (can't make request startup fail on
+    demand).
+- **Acceptance evidence** (PHP 8.4.26 and 8.5.11, toolchain image, debug Rust build):
+  - `pool` (8 threads): 10,000 concurrent echo requests (binary key/value, null and
+    duplicate headers, varying partition/offset/attempt) all returned byte-identical
+    with their own coordinates, in ~0.65–0.7 s; 8 × 1 s sleeps finished in 1.00 s;
+    16 × 0.5 s sleeps (2 × capacity) queued and finished at 0.50 s / 1.00 s; 4
+    busy loops with `set_time_limit(1)` → `SoftTimeout` while 4 concurrent 1.5 s
+    sleeps on the other threads succeeded, threads reused afterwards; log lines
+    carry the message context; second `start` → `AlreadyStarted` (zero hard timeout →
+    `InvalidConfig`); shutdown with 8 in-flight 1 s requests (grace 5 s) completed
+    all of them in ~1.01 s, then `runtime_shut_down: true`, and `execute` answers
+    `Bootstrap`.
+  - `hard_timeout` (2 threads, hard 1 s, max abandoned 2): a `usleep(3 s)` with no
+    soft timeout → `HardTimeout` at 1.00 s while the other thread served ~2,000
+    requests; replacement live immediately (2 × 0.5 s sleeps in parallel while the
+    abandoned thread still blocks); the abandoned thread exits after its request
+    (`abandoned` back to 0). Second abandonment → `unhealthy` via `health_watch`,
+    pool still serving. Shutdown (grace 300 ms) with a stuck request → it gets
+    `HardTimeout` after 300 ms, report `{ abandoned_at_shutdown: 1,
+    abandoned_threads: 2, runtime_shut_down: false }`.
+  - `recycling` (4 threads, 10 requests/thread): 1,000 concurrent requests all
+    correct; `recycled_total` 99 (8.4) / 100 (8.5), within the exact bound
+    `0 ≤ 1000 − 10·recycled < 4·10`; clean shutdown afterwards.
+  - Found and fixed on 8.5: callers could receive `HardTimeout` before `health()`
+    showed the abandonment. Callers are now answered after the replacement is
+    spawned and health published; 15 consecutive runs of the three suites on 8.5
+    passed afterwards.
+- `cargo fmt --check`, `cargo clippy --workspace --all-targets --all-features -- -D
+  warnings` clean; `cargo test --workspace --all-features` passes on 8.4 and 8.5.
+- Run times: `pool` ~7 s, `hard_timeout` ~5 s, `recycling` < 1 s. A substring argument
+  filters cases (`cargo test -p k4p-php --test pool -- soft`); `K4P_TEST_ECHO_LOG=1`
+  echoes PHP log lines.
+- **Gotchas for S8:** see S8's *Notes from other steps*.
 
 **Notes from other steps:**
 - From S2: read S2's handoff notes first. In short: `k4p_php_sys::runtime_init` is
@@ -642,7 +706,19 @@ with due-time delays, DLQ, header conventions, `ExecutionError` mapping.
 
 **Handoff notes:** _(fill in when done)_
 
-**Notes from other steps:** _(none yet)_
+**Notes from other steps:**
+- From S3: build the executor with `k4p_php::PhpPool::start(PhpConfig, TracingLogSink)`
+  (map `[php]`/`[php.ini]`/`[timeouts]`: `[php.ini]` → `ini_entries` as `key=value`
+  lines; `threads`, `max_requests_per_thread`, `max_abandoned_threads` are `NonZero*`,
+  `hard_timeout` must be > 0 — validate these and "hard > max_execution_time" yourself
+  for exit 78). `StartError::Init` → exit 70. Any thread may call `start`/`shutdown`.
+  `shutdown(grace)` blocks: call it via `spawn_blocking` *after* the host has drained,
+  using what is left of `shutdown_grace`. Pool-unhealthy restart (§7.3, exit 75):
+  `pool.health_watch().wait_for(|h| h.unhealthy)`. `/healthz`: `pool.health()`.
+  PHP log records carry topic/partition/offset/attempt but **not the consumer name**
+  (`k4p-php` doesn't know it): derive it from `delivery_topic` if you need the
+  `consumer` field on PHP lines (§7.4). Pool events (abandoned thread etc.) are
+  `tracing` events from target `k4p_php::…`; PHP output uses target `php`.
 
 ---
 
