@@ -627,7 +627,21 @@ make honest throughput claims.
 
 **Handoff notes:** _(fill in when done)_
 
-**Notes from other steps:** _(none yet)_
+**Notes from other steps:**
+- From S4: **switch the benchmark to the real framework.** S4's benchmark
+  (`crates/k4p-php-sys/benches/request_cost.rs`) runs on an ad-hoc stand-in for this
+  package, `crates/k4p-php-sys/benches/app/src/Framework/` (namespace
+  `Bench\Framework\`), because `php/` didn't exist yet. As part of S5:
+  - make `benches/app/composer.json` require `kafka4php/framework` through a composer
+    `path` repository pointing at `php/` (the bench copies the app to a temp dir, so
+    use an absolute path or have the bench rewrite it; `composer dump-autoload` is no
+    longer enough — it needs `composer install`/`update`, offline, from the path repo);
+  - port `consumer.php`, `preload.php` and `src/App/OrderPlacedHandler.php` to
+    `Kafka4php\…`, and delete `benches/app/src/Framework/`;
+  - run `scripts/dev.sh cargo bench -p k4p-php-sys --bench request_cost` on PHP 8.4
+    and 8.5 (laptop on AC power, nothing else running) and update the table, system
+    details and ratios in DESIGN.md §5.7 and the description of the `kernel`
+    scenario there.
 
 ---
 
