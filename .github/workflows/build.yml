@@ -1,6 +1,10 @@
-# Builds the toolchain image (docker/dev.Dockerfile) for every supported PHP version.
-# Green iff the image builds, which includes docker/php-check.sh verifying that the
-# base image's PHP is ZTS + embed + max execution timers + OPcache.
+# Builds the toolchain image (docker/dev.Dockerfile) and runs the Rust checks and test
+# suites inside it, for every supported PHP version (everything runs in the toolchain
+# container, as locally with scripts/dev.sh):
+#   build-and-test: image build (incl. docker/php-check.sh), cargo fmt --check, clippy
+#                   -D warnings, cargo test --workspace --all-features.
+#   leak-check:     the k4p-php-sys request-memory leak check against a ZTS debug PHP
+#                   (crates/k4p-php-sys/tests/leak-check.sh, exactly as run locally).
 name: build
 
 on:
@@ -17,13 +21,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
-    name: build (PHP ${{ matrix.php }})
+  build-and-test:
+    name: build and test (PHP ${{ matrix.php }})
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         php: ["8.4", "8.5"]
+    env:
+      IMAGE: kafka4php-dev:php${{ matrix.php }}
+      CARGO_CACHE: ${{ github.workspace }}/.ci-cargo-home
     steps:
       - uses: actions/checkout@v7
 
@@ -35,7 +42,52 @@ jobs:
           context: .
           file: docker/dev.Dockerfile
           build-args: PHP_VERSION=${{ matrix.php }}
-          tags: kafka4php-dev:php${{ matrix.php }}
+          tags: ${{ env.IMAGE }}
+          load: true
           push: false
           cache-from: type=gha,scope=dev-image-php${{ matrix.php }}
           cache-to: type=gha,mode=max,scope=dev-image-php${{ matrix.php }}
+
+      - name: Cache cargo registry and target/
+        uses: actions/cache@v6
+        with:
+          path: |
+            ${{ env.CARGO_CACHE }}
+            target
+          key: cargo-php${{ matrix.php }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-php${{ matrix.php }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml') }}-
+            cargo-php${{ matrix.php }}-
+
+      - name: cargo fmt, clippy and test (in the toolchain image)
+        run: |
+          mkdir -p "$CARGO_CACHE/registry" "$CARGO_CACHE/git"
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" -w /work \
+            -v "$CARGO_CACHE/registry:/usr/local/cargo/registry" \
+            -v "$CARGO_CACHE/git:/usr/local/cargo/git" \
+            -e CARGO_TERM_COLOR=always \
+            "$IMAGE" bash -euo pipefail -c '
+              cargo fmt --all -- --check
+              cargo clippy --workspace --all-targets --all-features -- -D warnings
+              cargo test --workspace --all-features
+            '
+
+  leak-check:
+    name: leak check (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+    steps:
+      - uses: actions/checkout@v7
+
+      # Builds the toolchain image, then the debug PHP on top of it (no layer cache:
+      # the debug image builds FROM the locally built toolchain image), then runs the
+      # leak check in it.
+      - name: crates/k4p-php-sys/tests/leak-check.sh
+        env:
+          PHP_VERSION: ${{ matrix.php }}
+          CARGO_TERM_COLOR: always
+        run: crates/k4p-php-sys/tests/leak-check.sh
