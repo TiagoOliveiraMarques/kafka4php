@@ -639,30 +639,41 @@ PHP defaults, `on-vt0` = plus `opcache.validate_timestamps=0`.
 
 | scenario | OPcache | req/s | mean µs | p50 µs | p99 µs |
 |---|---|---:|---:|---:|---:|
-| empty | off (8.4) | 16,163 | 61.9 | 52.9 | 203.8 |
-| empty | off (8.5) | 15,414 | 64.9 | 55.2 | 212.7 |
-| empty | on | 30,209 | 33.1 | 29.4 | 117.5 |
-| empty | on-vt0 | 31,301 | 31.9 | 24.9 | 106.6 |
-| kernel | off (8.4) | 474 | 2,111.1 | 1,981.0 | 3,718.1 |
-| kernel | off (8.5) | 485 | 2,061.8 | 1,942.9 | 3,580.2 |
-| kernel | on | 12,154 | 82.3 | 64.0 | 237.8 |
-| kernel | on-vt0 | 11,826 | 84.6 | 64.7 | 246.4 |
-| preload | on | 16,320 | 61.3 | 47.5 | 194.6 |
-| preload | on-vt0 | 15,744 | 63.5 | 54.0 | 212.4 |
+| empty | off (8.4) | 49,452 | 20.2 | 18.1 | 50.7 |
+| empty | off (8.5) | 47,766 | 20.9 | 18.7 | 53.9 |
+| empty | on | 92,894 | 10.8 | 9.8 | 30.8 |
+| empty | on-vt0 | 93,338 | 10.7 | 9.8 | 24.9 |
+| kernel | off (8.4) | 1,485 | 673.3 | 642.1 | 1,128.2 |
+| kernel | off (8.5) | 1,458 | 685.9 | 646.3 | 1,232.5 |
+| kernel | on | 36,745 | 27.2 | 24.8 | 66.7 |
+| kernel | on-vt0 | 36,827 | 27.2 | 24.6 | 67.6 |
+| preload | on | 48,441 | 20.6 | 18.9 | 54.5 |
+| preload | on-vt0 | 48,058 | 20.8 | 18.9 | 55.0 |
 
-`on` rows are PHP 8.5.11 (8.4.26 has no OPcache under our SAPI, §5.1). Machine: Docker
-Desktop (WSL2) on a Windows 11 laptop, 16 vCPUs. **Absolute numbers on this machine
-vary by ~2.5× between sessions** (an earlier run the same day measured `empty`/on at
-~13 µs, `kernel`/on at ~35 µs and `kernel`/off at ~0.9 ms); the ratios below held in
-every run and are the claims to rely on:
+`on` rows are PHP 8.5.11 (8.4.26 has no OPcache under our SAPI, §5.1).
+
+**System** (run 2026-10-17; the bench prints the container-side lines itself):
+
+- Host: ASUS ROG Zephyrus G14 (GA401IU) laptop, **on AC power**, Windows 11 Home
+  (10.0.26200), power plan "High performance".
+- CPU: AMD Ryzen 7 4800HS (8 cores / 16 threads, 2.9 GHz base); 16 CPUs visible in
+  the container.
+- Memory: 31.4 GiB host; 15.3 GiB in the Docker Desktop VM (13.8 GiB available).
+- Docker Desktop (engine 28.3.3), WSL2 kernel 5.15.167.4-microsoft-standard-WSL2,
+  transparent huge pages `always`; toolchain image (Debian bookworm), no other
+  containers running.
+
+**Run-to-run variance:** the same machine on battery power measured every row ~3×
+slower (e.g. `kernel`/on 82 µs, `kernel`/off 2.1 ms) with wider tails; the ratios
+below held in every run and are the claims to rely on:
 
 - **OPcache is the lever that matters.** Without it a typical entrypoint recompiles
   every file it includes on every message: `kernel` is **~25× slower** than with
-  OPcache (≈ 0.5–1k msg/s per thread vs 12–30k). This is the cost of PHP 8.4 (§5.1).
-- The host + request lifecycle floor (`empty`, OPcache on) is tens of µs per message
-  (≈ 30–80k msg/s per thread); OPcache halves even that.
-- **Preload** saves ~25% over `kernel` with ~15 classes per message; it pays more the
-  more classes a message loads.
+  OPcache (≈ 1.5k msg/s per thread vs ≈ 37k here). This is the cost of PHP 8.4 (§5.1).
+- The host + request lifecycle floor (`empty`, OPcache on) is ~11 µs per message
+  (≈ 90k msg/s per thread); OPcache halves even that.
+- **Preload** saves ~25% over `kernel` with ~15 classes per message (27 → 21 µs); it
+  pays more the more classes a message loads.
 - `validate_timestamps=0` is within run-to-run noise from a local filesystem (it saves
   `stat()` calls, which matter on slow filesystems: on the Docker Desktop bind mount
   an `empty` request costs ~5 ms, so never run code from a bind mount in production).

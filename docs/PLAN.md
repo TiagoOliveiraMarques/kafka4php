@@ -537,14 +537,14 @@ make honest throughput claims.
     (PHP starts once per process), 3 runs per row, prints the Markdown table.
     Needs `composer` (toolchain image) to generate the app's autoloader in a temp copy.
 - **No SAPI fix was needed**: OPcache, preload and the tracing JIT work as is on 8.5.
-- **Benchmark** (one thread; full table and caveats in DESIGN.md §5.7). Last run,
-  median of 3 × 50k requests, µs mean per request: `empty` off 62–65 / on 33;
-  `kernel` off ~2,060–2,110 (8.4 and 8.5 alike) / on 82; `preload` 61;
-  `validate_timestamps=0` within noise. An earlier run the same day was ~2.5× faster
-  across the board (`empty`/on 13 µs, `kernel`/on 35–39 µs, `kernel`/off ~0.9 ms):
-  this machine (Docker Desktop on a Windows laptop) is noisy, so DESIGN.md states the
-  stable *ratios*: OPcache ≈ 25× for a typical entrypoint, 2× for an empty one;
-  preload ≈ −25% with ~15 classes.
+- **Benchmark** (one thread; full table, system details and caveats in DESIGN.md
+  §5.7). Recorded run: Ryzen 7 4800HS laptop on AC power, Docker Desktop/WSL2, median
+  of 3 × 50k requests, µs mean per request: `empty` off 20–21 / on 11; `kernel` off
+  ~675–685 (8.4 and 8.5 alike) / on 27; `preload` 21; `validate_timestamps=0` within
+  noise. The same laptop on battery was ~3× slower across the board with wider tails,
+  so DESIGN.md states the stable *ratios*: OPcache ≈ 25× for a typical entrypoint, 2×
+  for an empty one; preload ≈ −25% with ~15 classes. The bench prints the
+  container-side system info (CPU, memory, kernel, THP) above its table.
 - **Fixed a flaky S2 test** (`tests/memory.rs`): on 8.5 it failed once with RSS
   +5.24% — a single +1.7 MiB step mid-run. Cause: transparent huge pages are `always`
   in Docker Desktop's VM (`max_ptes_none=511`), and khugepaged collapses 2 MiB-aligned

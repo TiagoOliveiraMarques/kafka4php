@@ -16,9 +16,9 @@
 //! PHP can start once per process, so the driver re-runs this binary [`RUNS`] times per
 //! row (`K4P_BENCH_ROW=<scenario>/<opcache>`), each child running the measurement as
 //! the single case of the shared test harness, and prints a Markdown table of the
-//! median runs. The app is copied to a temp dir first: off the slow `/work` bind mount
-//! of Docker Desktop. Env: `K4P_BENCH_REQUESTS` (measured requests per row, default
-//! 20,000).
+//! median runs, preceded by the system it ran on. The app is copied to a temp dir first:
+//! off the slow `/work` bind mount of Docker Desktop. Env: `K4P_BENCH_REQUESTS`
+//! (measured requests per row, default 20,000).
 
 #[path = "../tests/common/mod.rs"]
 mod common;
@@ -182,6 +182,52 @@ fn run_child(exe: &Path, row: &Row) -> Option<Stats> {
     stats
 }
 
+/// The first `key: value` line of a `/proc`-style file whose key is `key`.
+fn proc_field(path: &str, key: &str) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .filter_map(|l| l.split_once(':'))
+                .find(|(k, _)| k.trim() == key)
+                .map(|(_, v)| v.trim().to_owned())
+        })
+        .unwrap_or_else(|| "?".into())
+}
+
+fn first_line(path: &str) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.lines().next().map(str::to_owned))
+        .unwrap_or_else(|| "?".into())
+}
+
+/// The system the numbers come from, as seen from inside the container.
+fn print_system() {
+    let kib = |v: String| {
+        v.trim_end_matches("kB")
+            .trim()
+            .parse::<f64>()
+            .map_or("?".into(), |k| format!("{:.1} GiB", k / 1024.0 / 1024.0))
+    };
+    let cpus = std::thread::available_parallelism().map_or(0, |n| n.get());
+    println!("System:");
+    println!(
+        "- CPU: {}, {cpus} CPUs available",
+        proc_field("/proc/cpuinfo", "model name")
+    );
+    println!(
+        "- Memory: {} total, {} available",
+        kib(proc_field("/proc/meminfo", "MemTotal")),
+        kib(proc_field("/proc/meminfo", "MemAvailable"))
+    );
+    println!("- Kernel: {}", first_line("/proc/sys/kernel/osrelease"));
+    println!(
+        "- Transparent huge pages: {}",
+        first_line("/sys/kernel/mm/transparent_hugepage/enabled")
+    );
+}
+
 fn driver() {
     let version = php_version_id();
     println!(
@@ -190,6 +236,8 @@ fn driver() {
         version / 100 % 100,
         version % 100
     );
+    print_system();
+    println!();
     println!("| scenario | OPcache | req/s | mean µs | p50 µs | p99 µs |");
     println!("|---|---|---:|---:|---:|---:|");
     let exe = std::env::current_exe().expect("current_exe");
