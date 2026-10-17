@@ -1,5 +1,5 @@
-//! Recycling (PLAN.md S3): 4 threads replaced after 10 requests each; 1,000 requests
-//! all succeed and the number of replacements matches.
+//! Recycling (PLAN.md S3): 4 threads replaced after 9 or 10 requests each (a limit of
+//! 10 with jitter); 1,000 requests all succeed and the number of replacements matches.
 
 mod common;
 
@@ -10,6 +10,8 @@ use k4p_php::{PhpPool, ShutdownReport};
 
 const THREADS: usize = 4;
 const MAX_REQUESTS: u64 = 10;
+/// The lowest limit a thread may draw (`max - max/10`).
+const MIN_REQUESTS: u64 = 9;
 const REQUESTS: u64 = 1_000;
 
 fn recycles_every_max_requests(pool: &PhpPool) {
@@ -21,18 +23,19 @@ fn recycles_every_max_requests(pool: &PhpPool) {
         assert_eq!(content_value(o), i.to_string().as_bytes(), "request {i}");
     }
 
-    // Every finished thread served exactly MAX_REQUESTS; the live ones fewer:
-    // REQUESTS = MAX_REQUESTS * recycled + (< MAX_REQUESTS per live thread).
+    // Every finished thread served its limit, MIN_REQUESTS..=MAX_REQUESTS; the live
+    // ones fewer than theirs (< MAX_REQUESTS). So, with r = recycled:
+    //   MIN_REQUESTS * r <= REQUESTS < MAX_REQUESTS * r + THREADS * MAX_REQUESTS.
     let settled = wait_until(Duration::from_secs(5), || {
         let h = pool.health();
         h.live_threads == THREADS
-            && REQUESTS - MAX_REQUESTS * h.recycled_total < THREADS as u64 * MAX_REQUESTS
+            && REQUESTS < MAX_REQUESTS * h.recycled_total + THREADS as u64 * MAX_REQUESTS
     });
     let health = pool.health();
     println!("  {REQUESTS} requests: {health:?}");
     assert!(settled, "{health:?}");
     assert!(
-        REQUESTS >= MAX_REQUESTS * health.recycled_total,
+        MIN_REQUESTS * health.recycled_total <= REQUESTS,
         "{health:?}"
     );
     assert_eq!((health.abandoned_total, health.unhealthy), (0, false));

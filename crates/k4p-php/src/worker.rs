@@ -1,5 +1,5 @@
 //! A PHP worker thread: `thread_init`, requests from the shared queue one at a time,
-//! `thread_shutdown`, exit. It leaves after `max_requests_per_thread` requests
+//! `thread_shutdown`, exit. It leaves after its drawn request limit
 //! (recycling), after its request was abandoned by the watchdog, after a request
 //! could not start (the thread is unusable), or when the pool closes.
 
@@ -22,6 +22,7 @@ pub(crate) fn run(shared: Arc<Shared>, id: WorkerId) {
         tracing::error!(thread = id, "PHP thread init failed: runtime not running");
         return;
     }
+    let limit = shared.settings.draw_request_limit();
     let mut served = 0;
     while let Some(msg) = shared.next_job(id) {
         let outcome = log::with_context(&msg, || k4p_php_sys::execute(&msg));
@@ -41,7 +42,7 @@ pub(crate) fn run(shared: Arc<Shared>, id: WorkerId) {
             tracing::warn!(thread = id, "PHP thread unusable ({why}); replacing it");
             break;
         }
-        if served >= shared.settings.max_requests_per_thread {
+        if served >= limit {
             exit.recycled = true;
             break;
         }

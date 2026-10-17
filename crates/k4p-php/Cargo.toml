@@ -10,6 +10,7 @@ publish = false
 k4p-core.workspace = true
 k4p-php-sys = { path = "../k4p-php-sys" }
 tokio = { workspace = true, features = ["sync"] }
+fastrand = "2"
 tracing = "0.1"
 
 [dev-dependencies]

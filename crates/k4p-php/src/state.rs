@@ -43,6 +43,15 @@ pub(crate) struct Settings {
     pub max_abandoned_threads: u64,
 }
 
+impl Settings {
+    /// A new thread's recycling limit, uniform in `[max - max/10, max]`: threads that
+    /// start together and share a steady load would otherwise all retire at once.
+    pub fn draw_request_limit(&self) -> u64 {
+        let max = self.max_requests_per_thread;
+        fastrand::u64(max - max / 10..=max)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Job {
     pub msg: InboundMessage,
@@ -259,4 +268,36 @@ pub(crate) fn reject(job: Job, why: &str) {
     let _ = job
         .reply
         .send(Err(ExecutionError::Bootstrap(why.to_owned())));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn settings(max_requests_per_thread: u64) -> Settings {
+        Settings {
+            threads: 1,
+            max_requests_per_thread,
+            hard_timeout: Duration::from_secs(1),
+            max_abandoned_threads: 1,
+        }
+    }
+
+    #[test]
+    fn request_limits_are_jittered_below_the_max() {
+        let s = settings(1000);
+        let limits: Vec<u64> = (0..1000).map(|_| s.draw_request_limit()).collect();
+        assert!(
+            limits.iter().all(|l| (900..=1000).contains(l)),
+            "{limits:?}"
+        );
+        let distinct: std::collections::HashSet<_> = limits.iter().collect();
+        assert!(distinct.len() > 50, "not spread: {distinct:?}");
+    }
+
+    #[test]
+    fn small_limits_stay_valid() {
+        assert_eq!(settings(1).draw_request_limit(), 1);
+        assert!((9..=10).contains(&settings(10).draw_request_limit()));
+    }
 }

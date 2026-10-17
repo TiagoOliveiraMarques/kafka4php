@@ -421,6 +421,8 @@ and a health signal. DESIGN.md §5.5.
     returns `ShutdownReport { abandoned_at_shutdown, abandoned_threads,
     runtime_shut_down }`. While closing, every request's deadline is cut to the end
     of the grace period, so the watchdog enforces grace and hard timeout alike.
+  - Recycling is jittered (PR review): each thread draws its limit uniformly from
+    `[max - max/10, max]`, so threads started together don't all retire at once.
   - A thread whose request returned `Bootstrap` (failed `php_request_startup`) is
     replaced. This path is not covered by a test (can't make request startup fail on
     demand).
@@ -444,8 +446,8 @@ and a health signal. DESIGN.md §5.5.
     `HardTimeout` after 300 ms, report `{ abandoned_at_shutdown: 1,
     abandoned_threads: 2, runtime_shut_down: false }`.
   - `recycling` (4 threads, 10 requests/thread): 1,000 concurrent requests all
-    correct; `recycled_total` 99 (8.4) / 100 (8.5), within the exact bound
-    `0 ≤ 1000 − 10·recycled < 4·10`; clean shutdown afterwards.
+    correct; `recycled_total` within the exact bound `9·r ≤ 1000 < 10·r + 4·10`
+    (limits drawn in 9..=10); clean shutdown afterwards.
   - Found and fixed on 8.5: callers could receive `HardTimeout` before `health()`
     showed the abandonment. Callers are now answered after the replacement is
     spawned and health published; 15 consecutive runs of the three suites on 8.5

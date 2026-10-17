@@ -19,7 +19,9 @@ pub struct PhpConfig {
     pub ini_entries: String,
     /// PHP threads (= `Executor::capacity()`).
     pub threads: NonZeroUsize,
-    /// Requests after which a thread is replaced by a fresh one.
+    /// Upper bound of requests after which a thread is replaced by a fresh one. Each
+    /// thread draws its own limit in `[max - max/10, max]`, so they retire at
+    /// different times.
     pub max_requests_per_thread: NonZeroU64,
     /// Watchdog: a request running longer is answered `HardTimeout` and its thread
     /// abandoned. Must be non-zero.

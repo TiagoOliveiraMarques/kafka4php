@@ -546,10 +546,12 @@ API: `PhpPool::start(PhpConfig, impl LogSink) -> Result<PhpPool, StartError>`
   whether or not those threads came back) or a replacement thread could not be
   spawned. Unhealthy is sticky; the pool keeps executing, and the binary performs a
   graceful process restart (§7.3), e.g. awaiting `health_watch().wait_for(|h| h.unhealthy)`.
-- **Recycling:** after `php.max_requests_per_thread` requests, a thread answers its
-  last request, calls `k4p_thread_shutdown()` (`ts_free_thread()`), exits, and is
-  replaced by a fresh thread; queued messages wait for it, none is dropped. Handles
-  per-thread leaks. Process-wide extension leaks are handled by process restarts
+- **Recycling:** after its request limit, a thread answers its last request, calls
+  `k4p_thread_shutdown()` (`ts_free_thread()`), exits, and is replaced by a fresh
+  thread; queued messages wait for it, none is dropped. Each thread draws its limit
+  uniformly from `[max - max/10, max]` (`max` = `php.max_requests_per_thread`, so it
+  stays an upper bound): under the steady load of a consumer, threads started
+  together would otherwise all retire at once. Handles per-thread leaks. Process-wide extension leaks are handled by process restarts
   (cheap thanks to static membership). A thread whose request could not start
   (`Bootstrap`, §5.1) is replaced the same way.
 - **Shutdown** (`shutdown(grace)`, blocking; idempotent, later calls return the first
