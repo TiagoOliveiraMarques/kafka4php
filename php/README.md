@@ -21,12 +21,13 @@ require __DIR__ . '/vendor/autoload.php';
 use Kafka4php\Kernel;
 use Kafka4php\Router;
 
-Kernel::run((new Router())
+(new Kernel())->run((new Router())
     ->on('orders', new App\OrderPlacedHandler(new App\StockService()))
     ->on('payments', new App\PaymentHandler()));
 ```
 
-`Kernel::run()` takes a `Router`, any `Handler`, or a `callable(Message): Result`.
+A handler is any `callable(Message): Result`: a class implementing `Handler`
+(`__invoke`), a closure, or a `Router` (which is a `Handler` itself, so routers nest).
 The `Router` dispatches on the message's logical topic — retried messages arrive with
 their original topic, so they reach the same handler. A message for a topic without a
 handler fails (it goes to the DLQ).
@@ -45,7 +46,7 @@ final class OrderPlacedHandler implements Handler
     {
     }
 
-    public function handle(Message $message): Result
+    public function __invoke(Message $message): Result
     {
         $order = json_decode($message->value ?? '', true);
         if (!is_array($order)) {
@@ -85,12 +86,12 @@ kafka4php's own `k4p-*` headers are never shown to handlers.
 
 ## Exceptions
 
-`Kernel::run()` catches anything the handler throws (also a callable returning
-something other than a `Result`, as a `TypeError`) and reports a result for it:
+`Kernel::run()` catches anything the handler throws (also the `TypeError` of one
+returning something other than a `Result`) and reports a result for it:
 
 - by default `RetryLater("<class>: <message>")`: retried, and dead-lettered once the
   attempts are exhausted;
-- with `Kernel::run($router, onException: ExceptionPolicy::Fail)`,
+- with `(new Kernel(onException: ExceptionPolicy::Fail))->run($router)`,
   `Fail("<class>: <message>", errorClass: <class>)`: dead-lettered right away.
 
 Return `Fail` / `RetryLater` yourself where you know better. A fatal error, `exit()`
@@ -107,7 +108,7 @@ without a result, or a timeout is handled by kafka4php itself (as a retry).
 ## Testing handlers
 
 Handlers are plain PHP: test them with `Testing\MessageBuilder`. To test the
-entrypoint's `Kernel::run()` call, give it a `Testing\FakeNativeBridge`:
+entrypoint's `Kernel`, construct it with a `Testing\FakeNativeBridge`:
 
 ```php
 use Kafka4php\Kernel;
@@ -118,10 +119,10 @@ $message = MessageBuilder::forTopic('orders')
     ->withValue('{"id": 1}')
     ->withHeader('trace-id', 'abc');
 
-$result = (new OrderPlacedHandler($stock))->handle($message->build());
+$result = (new OrderPlacedHandler($stock))($message->build());
 
-$bridge = new FakeNativeBridge($message->withAttempt(2));
-Kernel::run($router, $bridge);
+$bridge = new FakeNativeBridge($message->withAttempt(2)); // the builder is mutable
+(new Kernel($bridge))->run($router);
 $bridge->results(); // [['type' => 'no_content']]: the arrays kafka4php would receive
 ```
 

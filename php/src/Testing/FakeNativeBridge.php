@@ -8,8 +8,9 @@ use Kafka4php\NativeBridge;
 
 /**
  * Stands in for the native functions when testing an entrypoint's Kernel::run() call:
- * serves one message and records every result reported, as the arrays the native
- * `result()` receives. It does not validate them like the C side does.
+ * serves one message (as built when the bridge was created) and records every result
+ * reported, as the arrays the native `result()` receives. It does not validate them
+ * like the C side does.
  *
  * @phpstan-import-type NativeMessage from NativeBridge
  * @phpstan-import-type NativeResult from NativeBridge

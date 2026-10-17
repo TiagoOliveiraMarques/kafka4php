@@ -22,8 +22,8 @@ final class RouterTest extends TestCase
             ->on('orders', self::replyWith('orders'))
             ->on('payments', self::replyWith('payments'));
 
-        self::assertEquals(new RetryLater('orders'), $router->handle(MessageBuilder::forTopic('orders')->build()));
-        self::assertEquals(new RetryLater('payments'), $router->handle(MessageBuilder::forTopic('payments')->build()));
+        self::assertEquals(new RetryLater('orders'), $router(MessageBuilder::forTopic('orders')->build()));
+        self::assertEquals(new RetryLater('payments'), $router(MessageBuilder::forTopic('payments')->build()));
     }
 
     public function testDispatchesRetriedMessagesByLogicalTopic(): void
@@ -31,7 +31,7 @@ final class RouterTest extends TestCase
         $router = (new Router())->on('orders', self::replyWith('orders'));
         $retried = MessageBuilder::forTopic('orders')->withDeliveryTopic('orders.retry.10s')->withAttempt(2);
 
-        self::assertEquals(new RetryLater('orders'), $router->handle($retried->build()));
+        self::assertEquals(new RetryLater('orders'), $router($retried->build()));
     }
 
     public function testPassesTheMessageToTheHandler(): void
@@ -39,7 +39,7 @@ final class RouterTest extends TestCase
         $message = MessageBuilder::forTopic('orders')->withValue('payload')->build();
         $router = (new Router())->on('orders', static fn (Message $m): Result => new RetryLater((string) $m->value));
 
-        self::assertEquals(new RetryLater('payload'), $router->handle($message));
+        self::assertEquals(new RetryLater('payload'), $router($message));
     }
 
     public function testUnknownTopicFails(): void
@@ -48,18 +48,19 @@ final class RouterTest extends TestCase
 
         self::assertEquals(
             new Fail('no handler for topic "refunds"'),
-            $router->handle(MessageBuilder::forTopic('refunds')->build()),
+            $router(MessageBuilder::forTopic('refunds')->build()),
         );
         self::assertEquals(
             new Fail('no handler for topic "orders.retry.10s"'),
-            (new Router())->handle(MessageBuilder::forTopic('orders.retry.10s')->build()),
+            (new Router())(MessageBuilder::forTopic('orders.retry.10s')->build()),
         );
     }
 
-    public function testTakesCallables(): void
+    public function testTakesAnyCallable(): void
     {
         $router = (new Router())
             ->on('closure', static fn (Message $m): Result => new NoContent())
+            ->on('router', (new Router())->on('router', self::replyWith('nested')))
             ->on('invokable', new class () {
                 public function __invoke(Message $message): Result
                 {
@@ -67,8 +68,9 @@ final class RouterTest extends TestCase
                 }
             });
 
-        self::assertEquals(new NoContent(), $router->handle(MessageBuilder::forTopic('closure')->build()));
-        self::assertEquals(new RetryLater('invokable'), $router->handle(MessageBuilder::forTopic('invokable')->build()));
+        self::assertEquals(new NoContent(), $router(MessageBuilder::forTopic('closure')->build()));
+        self::assertEquals(new RetryLater('invokable'), $router(MessageBuilder::forTopic('invokable')->build()));
+        self::assertEquals(new RetryLater('nested'), $router(MessageBuilder::forTopic('router')->build()));
     }
 
     public function testCallableReturningAnythingButAResultIsATypeError(): void
@@ -77,8 +79,8 @@ final class RouterTest extends TestCase
         $router = (new Router())->on('orders', static fn (Message $m): string => 'done');
 
         $this->expectException(\TypeError::class);
-        $this->expectExceptionMessage('Handler must return Kafka4php\Result\Result, string returned');
-        $router->handle(MessageBuilder::forTopic('orders')->build());
+        $this->expectExceptionMessage('Kafka4php\Router::__invoke(): Return value must be of type Kafka4php\Result\Result, string returned');
+        $router(MessageBuilder::forTopic('orders')->build());
     }
 
     public function testRejectsASecondHandlerForATopic(): void
@@ -94,7 +96,7 @@ final class RouterTest extends TestCase
     {
         $router = (new Router())->on('123', self::replyWith('numeric'));
 
-        self::assertEquals(new RetryLater('numeric'), $router->handle(MessageBuilder::forTopic('123')->build()));
+        self::assertEquals(new RetryLater('numeric'), $router(MessageBuilder::forTopic('123')->build()));
     }
 
     /** A handler whose result names it. */
@@ -105,7 +107,7 @@ final class RouterTest extends TestCase
             {
             }
 
-            public function handle(Message $message): Result
+            public function __invoke(Message $message): Result
             {
                 return new RetryLater($this->name);
             }

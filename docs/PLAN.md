@@ -630,16 +630,19 @@ make honest throughput claims.
   `php >=8.4`; dev: PHPUnit 12, PHPStan 2). `src/`: `NativeBridge` (+ the §5.2 shapes
   as PHPStan type aliases), `NativeFunctionsBridge`, `Message`, `Headers`,
   `OutboundMessage`, `Result\{Result,NoContent,Content,Fail,RetryLater}`, `Handler`,
-  `Router`, `Kernel`, `ExceptionPolicy` (enum), internal `CallableHandler`,
+  `Router`, `Kernel`, `ExceptionPolicy` (enum),
   `Testing\{MessageBuilder,FakeNativeBridge}`; `stubs/native.php`; `README.md`.
   As-built API in DESIGN.md §5.4.
-- **Deviations (DESIGN.md §5.4 updated):** `Kernel::run(Handler|callable, ?NativeBridge,
-  ExceptionPolicy $onException = ExceptionPolicy::RetryLater)` — `Router` implements
-  `Handler`, so `Router` is no longer a separate union member; the exception policy is
-  the third parameter. Exception reason is `"<FQCN>: <message>"`; `Fail` mode sets
-  `error_class` to the FQCN. A callable returning a non-`Result` throws `\TypeError`
-  (same class PHP throws for a `Handler` returning the wrong type) and goes through
-  the policy. `Headers::has()` added. Router: duplicate topic →
+- **Deviations (DESIGN.md §5.4 updated; reshaped by PR review):** handlers are plain
+  `callable(Message): Result` — `Handler` declares `__invoke` (not `handle`), `Router`
+  implements it, and nothing adapts callables. `Kernel` is configured by its
+  constructor (`new Kernel(NativeBridge = new NativeFunctionsBridge(), ExceptionPolicy
+  = RetryLater)`) and run with `->run($handler)`; entrypoints write
+  `(new Kernel())->run($router)`. Exception reason is `"<FQCN>: <message>"`; `Fail`
+  mode sets `error_class` to the FQCN. A non-`Result` return is PHP's own return-type
+  `\TypeError` (from the handler's `__invoke`, the Router's, or the Kernel's private
+  `resultOf()` for untyped callables) and goes through the policy. `MessageBuilder`
+  is mutable. `Headers::has()` added. Router: duplicate topic →
   `\InvalidArgumentException`; unknown → `Fail('no handler for topic "X"')` (quoted).
 - **No PHP-side validation:** results are not re-validated (C does it, §5.2), and
   `FakeNativeBridge` records results unvalidated — an invalid result (e.g. empty topic)
@@ -656,10 +659,10 @@ make honest throughput claims.
   `php/src/` as `<temp>/framework` (not `php/vendor/`: copying that off the bind mount
   took 3.5 min) and runs `composer update --optimize-autoloader --no-dev` in
   `<temp>/app` once for all child runs (`K4P_BENCH_APP`). Re-recorded on PHP 8.4 and
-  8.5 (same laptop, AC power): DESIGN.md §5.7. `kernel` costs 32 µs with OPcache (was
-  27 µs) and 833 µs without (was 673 µs): the framework's two extra classes per
-  request (`CallableHandler`, `ExceptionPolicy`) and twice the source. Ratios: OPcache
-  still ~25×, preload now −30%.
+  8.5 (same laptop, AC power) after the review changes: DESIGN.md §5.7. Above the
+  `empty` floor (which drifts ~5–10% between sessions), `kernel` costs ~5 µs more with
+  OPcache than on the stand-in and ~200 µs more without: one more class
+  (`ExceptionPolicy`) and twice the source. Ratios: OPcache still ~25×, preload −30%.
 - **For S9:** inside the SAPI, the framework has only run via the benchmark: `Kernel` +
   `Router` + `NativeFunctionsBridge` → `NoContent`, 8.4 and 8.5. The other results and
   the exception policy are covered by unit tests only. The entrypoint needs
@@ -873,7 +876,7 @@ covering DESIGN.md §9's E2E scenarios.
   log.
 - From S5: inside the SAPI the framework (`php/`) has only run the S4 benchmark's
   `NoContent` path; every other result and the exception policy are unit-tested with
-  `FakeNativeBridge` only. The example app should use `Kernel::run()` with the default
+  `FakeNativeBridge` only. The example app should use `(new Kernel())->run()` with the default
   `NativeFunctionsBridge` and exercise every result kind; include one invalid `Content`
   (e.g. empty topic), since PHP doesn't validate results — C does (§5.2).
 

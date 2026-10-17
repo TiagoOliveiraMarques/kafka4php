@@ -24,13 +24,13 @@ final class KernelTest extends TestCase
     {
         $bridge = new FakeNativeBridge(MessageBuilder::forTopic('orders')->withValue('v'));
         $handler = new class () implements Handler {
-            public function handle(Message $message): Result
+            public function __invoke(Message $message): Result
             {
                 return new Content(new OutboundMessage('orders.out', $message->value, 'k'));
             }
         };
 
-        Kernel::run($handler, $bridge);
+        (new Kernel($bridge))->run($handler);
 
         self::assertSame([['type' => 'content', 'messages' => [
             ['topic' => 'orders.out', 'value' => 'v', 'key' => 'k', 'headers' => [], 'partition' => null],
@@ -48,11 +48,11 @@ final class KernelTest extends TestCase
             ->withAttempt(3);
         $received = null;
 
-        Kernel::run(static function (Message $message) use (&$received): Result {
+        (new Kernel(new FakeNativeBridge($builder)))->run(static function (Message $message) use (&$received): Result {
             $received = $message;
 
             return new NoContent();
-        }, new FakeNativeBridge($builder));
+        });
 
         self::assertEquals($builder->build(), $received);
     }
@@ -61,7 +61,7 @@ final class KernelTest extends TestCase
     {
         $bridge = new FakeNativeBridge(MessageBuilder::forTopic('payments'));
 
-        Kernel::run((new Router())->on('orders', static fn (Message $m): Result => new NoContent()), $bridge);
+        (new Kernel($bridge))->run((new Router())->on('orders', static fn (Message $m): Result => new NoContent()));
 
         self::assertSame([['type' => 'fail', 'reason' => 'no handler for topic "payments"', 'error_class' => null]], $bridge->results());
     }
@@ -70,7 +70,7 @@ final class KernelTest extends TestCase
     {
         $bridge = new FakeNativeBridge(MessageBuilder::forTopic('orders'));
 
-        Kernel::run(static fn (Message $m): Result => throw new \RuntimeException('db down'), $bridge);
+        (new Kernel($bridge))->run(static fn (Message $m): Result => throw new \RuntimeException('db down'));
 
         self::assertSame([['type' => 'retry_later', 'reason' => 'RuntimeException: db down']], $bridge->results());
     }
@@ -79,10 +79,8 @@ final class KernelTest extends TestCase
     {
         $bridge = new FakeNativeBridge(MessageBuilder::forTopic('orders'));
 
-        Kernel::run(
+        (new Kernel($bridge, ExceptionPolicy::Fail))->run(
             static fn (Message $m): Result => throw new InvalidOrder('missing id'),
-            $bridge,
-            ExceptionPolicy::Fail,
         );
 
         self::assertSame([[
@@ -96,7 +94,7 @@ final class KernelTest extends TestCase
     {
         $bridge = new FakeNativeBridge(MessageBuilder::forTopic('orders'));
 
-        Kernel::run(static fn (Message $m): Result => throw new \DivisionByZeroError('Division by zero'), $bridge);
+        (new Kernel($bridge))->run(static fn (Message $m): Result => throw new \DivisionByZeroError('Division by zero'));
 
         self::assertSame([['type' => 'retry_later', 'reason' => 'DivisionByZeroError: Division by zero']], $bridge->results());
     }
@@ -108,11 +106,11 @@ final class KernelTest extends TestCase
         $handler = static fn (Message $m): ?Result => null;
 
         /** @phpstan-ignore argument.type (a wrong return type is under test) */
-        Kernel::run($handler, $retry);
+        (new Kernel($retry))->run($handler);
         /** @phpstan-ignore argument.type (a wrong return type is under test) */
-        Kernel::run($handler, $fail, ExceptionPolicy::Fail);
+        (new Kernel($fail, ExceptionPolicy::Fail))->run($handler);
 
-        $reason = 'TypeError: Handler must return Kafka4php\Result\Result, null returned';
+        $reason = 'TypeError: Kafka4php\Kernel::resultOf(): Return value must be of type Kafka4php\Result\Result, null returned';
         self::assertSame([['type' => 'retry_later', 'reason' => $reason]], $retry->results());
         self::assertSame([['type' => 'fail', 'reason' => $reason, 'error_class' => \TypeError::class]], $fail->results());
     }
@@ -123,18 +121,18 @@ final class KernelTest extends TestCase
         $handler = new class () implements Handler {
             public mixed $result = 'not a result';
 
-            public function handle(Message $message): Result
+            public function __invoke(Message $message): Result
             {
                 /** @phpstan-ignore return.type (PHP's own return type check is under test) */
                 return $this->result;
             }
         };
 
-        Kernel::run($handler, $bridge);
+        (new Kernel($bridge))->run($handler);
 
         self::assertSame([[
             'type' => 'retry_later',
-            'reason' => 'TypeError: Kafka4php\Handler@anonymous::handle(): Return value must be of type Kafka4php\Result\Result, string returned',
+            'reason' => 'TypeError: Kafka4php\Handler@anonymous::__invoke(): Return value must be of type Kafka4php\Result\Result, string returned',
         ]], $bridge->results());
     }
 
@@ -155,11 +153,19 @@ final class KernelTest extends TestCase
         };
 
         try {
-            Kernel::run(static fn (Message $m): Result => new NoContent(), $bridge);
+            (new Kernel($bridge))->run(static fn (Message $m): Result => new NoContent());
             self::fail('expected the bridge exception');
         } catch (\LogicException $exception) {
             self::assertSame('not in a kafka4php request', $exception->getMessage());
         }
         self::assertSame(0, $bridge->results);
+    }
+
+    public function testDefaultsToTheNativeFunctions(): void
+    {
+        // Outside the SAPI the native functions don't exist, so the default bridge fails.
+        $this->expectException(\Error::class);
+        $this->expectExceptionMessage('Call to undefined function Kafka4php\Native\message()');
+        (new Kernel())->run(static fn (Message $m): Result => new NoContent());
     }
 }

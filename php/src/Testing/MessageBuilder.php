@@ -9,7 +9,7 @@ use Kafka4php\NativeBridge;
 
 /**
  * Builds test messages: `MessageBuilder::forTopic('orders')->withValue('{...}')->build()`.
- * Immutable, so a builder can serve as a template. Defaults: partition 0, offset 0,
+ * Each `with*()` sets a field and returns the builder. Defaults: partition 0, offset 0,
  * no timestamp, null key and value, no headers, attempt 1, delivered via `$topic`.
  *
  * @phpstan-import-type NativeHeaders from NativeBridge
@@ -40,67 +40,59 @@ final class MessageBuilder
     /** As if consumed from `$deliveryTopic`, e.g. a retry topic. */
     public function withDeliveryTopic(string $deliveryTopic): self
     {
-        $builder = clone $this;
-        $builder->deliveryTopic = $deliveryTopic;
+        $this->deliveryTopic = $deliveryTopic;
 
-        return $builder;
+        return $this;
     }
 
     public function withPartition(int $partition): self
     {
-        $builder = clone $this;
-        $builder->partition = $partition;
+        $this->partition = $partition;
 
-        return $builder;
+        return $this;
     }
 
     public function withOffset(int $offset): self
     {
-        $builder = clone $this;
-        $builder->offset = $offset;
+        $this->offset = $offset;
 
-        return $builder;
+        return $this;
     }
 
     public function withTimestampMs(?int $timestampMs): self
     {
-        $builder = clone $this;
-        $builder->timestampMs = $timestampMs;
+        $this->timestampMs = $timestampMs;
 
-        return $builder;
+        return $this;
     }
 
     public function withKey(?string $key): self
     {
-        $builder = clone $this;
-        $builder->key = $key;
+        $this->key = $key;
 
-        return $builder;
+        return $this;
     }
 
     public function withValue(?string $value): self
     {
-        $builder = clone $this;
-        $builder->value = $value;
+        $this->value = $value;
 
-        return $builder;
+        return $this;
     }
 
     /** Appends a header; call again with the same name for duplicates. */
     public function withHeader(string $name, ?string $value): self
     {
-        $builder = clone $this;
-        $builder->headers[] = [$name, $value];
+        $this->headers[] = [$name, $value];
 
-        return $builder;
+        return $this;
     }
 
     public function withAttempt(int $attempt): self
     {
-        $builder = clone $this;
-        $builder->attempt = $attempt;
+        $this->attempt = $attempt;
 
-        return $builder;
+        return $this;
     }
 
     public function build(): Message

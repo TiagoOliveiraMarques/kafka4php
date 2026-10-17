@@ -123,14 +123,4 @@ final class MessageTest extends TestCase
             attempt: 3,
         ), $message);
     }
-
-    public function testBuilderIsImmutable(): void
-    {
-        $template = MessageBuilder::forTopic('orders')->withHeader('a', '1');
-        $derived = $template->withValue('v')->withHeader('b', '2');
-
-        self::assertNull($template->build()->value);
-        self::assertSame([['a', '1']], $template->build()->headers->toList());
-        self::assertSame([['a', '1'], ['b', '2']], $derived->build()->headers->toList());
-    }
 }

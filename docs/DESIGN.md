@@ -536,26 +536,31 @@ is only `php`) — not even on the native functions: they're reached through a
   All final readonly classes; `toNative()` always emits the optional keys
   (`key`, `headers`, `partition`, `error_class`), null/`[]` when unset.
 - `OutboundMessage(string $topic, ?string $value, ?string $key = null, array $headers = [], ?int $partition = null)`.
-- `Handler` interface: `handle(Message $message): Result`.
-- `Router implements Handler` — `on(topic, Handler|callable): self` maps a logical
-  topic (`Message::$topic`, so retries reach the same handler) to a handler; a second
+- A **handler** is any `callable(Message): Result`. `Handler` is the interface for
+  handler classes: `__invoke(Message $message): Result`, so the framework never
+  adapts anything — it just calls handlers.
+- `Router implements Handler` — `on(topic, callable): self` maps a logical topic
+  (`Message::$topic`, so retries reach the same handler) to a handler; a second
   handler for a topic is an `\InvalidArgumentException`. Unknown topic →
-  `Fail('no handler for topic "X"')`.
-- `Kernel::run(Handler|callable $handler, ?NativeBridge $bridge = null, ExceptionPolicy $onException = ExceptionPolicy::RetryLater): void`
-  (`null` bridge = `NativeFunctionsBridge`) — reads the message, invokes the handler,
-  catches any `Throwable` from it and maps it with the `ExceptionPolicy` enum, then
-  calls `result()` exactly once. `ExceptionPolicy::RetryLater` (default) →
+  `Fail('no handler for topic "X"')`. Being a handler, a router can be nested.
+- `Kernel` (final readonly) — configured by its constructor:
+  `new Kernel(NativeBridge $bridge = new NativeFunctionsBridge(), ExceptionPolicy $onException = ExceptionPolicy::RetryLater)`.
+  `run(callable $handler): void` reads the message, calls the handler, catches any
+  `Throwable` from it and maps it with the `ExceptionPolicy` enum, then calls
+  `result()` exactly once. `ExceptionPolicy::RetryLater` (default) →
   `RetryLater("<class>: <message>")`; `ExceptionPolicy::Fail` →
   `Fail("<class>: <message>", errorClass: <class>)` (`<class>` fully qualified).
-  Callables (`callable(Message): Result`) are adapted by the internal
-  `CallableHandler`; one returning anything but a `Result` throws a `\TypeError`
-  (as PHP does for a `Handler` class), which goes through the policy too. Exceptions
-  outside the handler (e.g. `message()` outside a request) are not caught.
-- `Testing\MessageBuilder` — immutable builder:
-  `MessageBuilder::forTopic('orders')->withValue(..)->withHeader(..)->build()`;
+  A handler returning anything but a `Result` is caught by PHP's own return type
+  checks — the `Result` return type of `Handler::__invoke` / `Router::__invoke`, or
+  for an untyped callable that of the `Kernel` method calling it — as a `\TypeError`,
+  which goes through the policy too. Exceptions outside the handler (e.g. `message()`
+  outside a request) are not caught.
+- `Testing\MessageBuilder` — mutable fluent builder (each `with*()` sets a field and
+  returns it): `MessageBuilder::forTopic('orders')->withValue(..)->withHeader(..)->build()`;
   defaults partition 0, offset 0, no timestamp/key/value/headers, attempt 1,
-  `delivery_topic` = topic. `Testing\FakeNativeBridge(MessageBuilder)` serves that
-  message and records every reported result array (`results()`), unvalidated.
+  `delivery_topic` = topic. `Testing\FakeNativeBridge(MessageBuilder)` serves the
+  message as built at construction and records every reported result array
+  (`results()`), unvalidated.
 - `stubs/native.php` — stubs for `Kafka4php\Native\*` for IDEs / PHPStan
   (`scanFiles`, never loaded at runtime).
 - Checks: `composer test` (PHPUnit 12, fails on warnings/risky/skipped) and
@@ -574,7 +579,7 @@ require __DIR__ . '/vendor/autoload.php';
 use Kafka4php\Kernel;
 use Kafka4php\Router;
 
-Kernel::run((new Router())
+(new Kernel())->run((new Router())
     ->on('orders', new App\OrderPlacedHandler())
     ->on('payments', new App\PaymentHandler()));
 ```
@@ -665,38 +670,40 @@ per row, after 1,000 warm-up requests; scripts on the container's own filesystem
 Scenarios: `empty` = an entrypoint that only calls `result()` (the host + request
 lifecycle floor); `kernel` = a typical entrypoint: composer autoloader (optimized),
 the real `kafka4php/framework` `Kernel::run` + `Router` (§5.4) and a trivial handler
-(decode a small JSON value, return `NoContent`), ~15 classes per request (11 of the
+(decode a small JSON value, return `NoContent`), ~14 classes per request (10 of the
 framework); `preload` = `kernel` with all app and framework classes in
 `opcache.preload`. OPcache `on` = PHP defaults, `on-vt0` = plus
 `opcache.validate_timestamps=0`.
 
 | scenario | OPcache | req/s | mean µs | p50 µs | p99 µs |
 |---|---|---:|---:|---:|---:|
-| empty | off (8.4) | 49,625 | 20.2 | 18.3 | 48.2 |
-| empty | off (8.5) | 45,650 | 21.9 | 19.7 | 54.8 |
-| empty | on | 91,463 | 10.9 | 10.2 | 23.4 |
-| empty | on-vt0 | 92,975 | 10.8 | 10.0 | 23.6 |
-| kernel | off (8.4) | 1,200 | 833.6 | 794.3 | 1,339.4 |
-| kernel | off (8.5) | 1,201 | 832.5 | 794.1 | 1,310.1 |
-| kernel | on | 31,199 | 32.1 | 29.9 | 68.6 |
-| kernel | on-vt0 | 31,711 | 31.5 | 28.8 | 73.7 |
-| preload | on | 44,975 | 22.2 | 20.6 | 54.2 |
-| preload | on-vt0 | 45,372 | 22.0 | 20.5 | 54.5 |
+| empty | off (8.4) | 44,955 | 22.2 | 19.3 | 63.2 |
+| empty | off (8.5) | 43,524 | 23.0 | 20.5 | 60.3 |
+| empty | on | 88,480 | 11.3 | 10.4 | 25.8 |
+| empty | on-vt0 | 89,217 | 11.2 | 10.0 | 32.3 |
+| kernel | off (8.4) | 1,137 | 879.2 | 845.6 | 1,479.8 |
+| kernel | off (8.5) | 1,133 | 882.7 | 857.7 | 1,378.6 |
+| kernel | on | 30,238 | 33.1 | 30.1 | 77.6 |
+| kernel | on-vt0 | 30,271 | 33.0 | 30.2 | 83.1 |
+| preload | on | 43,152 | 23.2 | 21.0 | 64.5 |
+| preload | on-vt0 | 41,665 | 24.0 | 21.4 | 68.6 |
 
 `on` rows are PHP 8.5.11 (8.4.26 has no OPcache under our SAPI, §5.1). The first
 recording (S4) ran `kernel` on a smaller stand-in framework (9 classes, half the
-source): 27.2 µs with OPcache, 673 µs without, 20.6 µs preloaded — the real one's two
-extra classes per request (`CallableHandler`, the `ExceptionPolicy` enum of
-`Kernel::run`'s default argument) and larger files cost ~5 µs with OPcache and
-~160 µs without it.
+source): 27.2 µs with OPcache, 673 µs without, 20.6 µs preloaded, on an `empty`
+floor of 10.8 / 20.2 µs. This machine's floor varies by ~5–10% between sessions
+(here 11.3 / 22.2 µs, reproduced by a second 8.5 run), so compare `kernel` above the
+floor: the real framework (one more class, the `ExceptionPolicy` enum loaded for the
+`Kernel` constructor's default; twice the source, mostly docblocks) costs ~5 µs more
+with OPcache (22 vs 16 µs above the floor) and ~200 µs more without.
 
-**System** (both recordings 2026-10-17; the bench prints the container-side lines itself):
+**System** (all recordings 2026-10-17; the bench prints the container-side lines itself):
 
 - Host: ASUS ROG Zephyrus G14 (GA401IU) laptop, **on AC power**, Windows 11 Home
   (10.0.26200), power plan "High performance".
 - CPU: AMD Ryzen 7 4800HS (8 cores / 16 threads, 2.9 GHz base); 16 CPUs visible in
   the container.
-- Memory: 31.4 GiB host; 15.3 GiB in the Docker Desktop VM (13.8–13.9 GiB available).
+- Memory: 31.4 GiB host; 15.3 GiB in the Docker Desktop VM (13.8 GiB available).
 - Docker Desktop (engine 28.3.3), WSL2 kernel 5.15.167.4-microsoft-standard-WSL2,
   transparent huge pages `always`; toolchain image (Debian bookworm), no other
   containers running.
@@ -707,10 +714,10 @@ below held in every run and are the claims to rely on:
 
 - **OPcache is the lever that matters.** Without it a typical entrypoint recompiles
   every file it includes on every message: `kernel` is **~25× slower** than with
-  OPcache (≈ 1.2k msg/s per thread vs ≈ 31k here). This is the cost of PHP 8.4 (§5.1).
+  OPcache (≈ 1.1k msg/s per thread vs ≈ 30k here). This is the cost of PHP 8.4 (§5.1).
 - The host + request lifecycle floor (`empty`, OPcache on) is ~11 µs per message
   (≈ 90k msg/s per thread); OPcache halves even that.
-- **Preload** saves ~30% over `kernel` with ~15 classes per message (32 → 22 µs); it
+- **Preload** saves ~30% over `kernel` with ~15 classes per message (33 → 23 µs); it
   pays more the more classes a message loads.
 - `validate_timestamps=0` is within run-to-run noise from a local filesystem (it saves
   `stat()` calls, which matter on slow filesystems: on the Docker Desktop bind mount

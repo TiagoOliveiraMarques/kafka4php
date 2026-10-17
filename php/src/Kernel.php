@@ -6,33 +6,39 @@ namespace Kafka4php;
 
 use Kafka4php\Result\Result;
 
-/** Runs one request: the entrypoint calls Kernel::run() once per message. */
-final class Kernel
+/** Runs one request: the entrypoint calls `(new Kernel())->run($handler)` once per message. */
+final readonly class Kernel
 {
-    private function __construct()
-    {
+    /**
+     * @param NativeBridge $bridge the native functions by default; Testing\FakeNativeBridge in tests
+     * @param ExceptionPolicy $onException what an exception thrown by the handler becomes
+     */
+    public function __construct(
+        private NativeBridge $bridge = new NativeFunctionsBridge(),
+        private ExceptionPolicy $onException = ExceptionPolicy::RetryLater,
+    ) {
     }
 
     /**
-     * Read the current message, hand it to `$handler` and report its result. An
-     * exception from the handler (including a callable not returning a Result) becomes
-     * a result through `$onException`; the result is always reported.
+     * Read the current message, hand it to `$handler` and report its result, exactly
+     * once. An exception from the handler (including the \TypeError of returning
+     * something other than a Result) becomes a result through the ExceptionPolicy.
      *
-     * @param Handler|callable(Message): Result $handler
-     * @param ?NativeBridge $bridge null = the native functions (Testing\FakeNativeBridge in tests)
+     * @param callable(Message): Result $handler a Handler, a Router or any callable
      */
-    public static function run(
-        Handler|callable $handler,
-        ?NativeBridge $bridge = null,
-        ExceptionPolicy $onException = ExceptionPolicy::RetryLater,
-    ): void {
-        $bridge ??= new NativeFunctionsBridge();
-        $message = Message::fromNative($bridge->message());
+    public function run(callable $handler): void
+    {
+        $message = Message::fromNative($this->bridge->message());
+        $this->bridge->result($this->resultOf($handler, $message)->toNative());
+    }
+
+    /** @param callable(Message): Result $handler */
+    private function resultOf(callable $handler, Message $message): Result
+    {
         try {
-            $result = CallableHandler::wrap($handler)->handle($message);
+            return $handler($message);
         } catch (\Throwable $exception) {
-            $result = $onException->resultFor($exception);
+            return $this->onException->resultFor($exception);
         }
-        $bridge->result($result->toNative());
     }
 }

@@ -6,4 +6,4 @@ use Bench\App\OrderPlacedHandler;
 use Kafka4php\Kernel;
 use Kafka4php\Router;
 
-Kernel::run((new Router())->on('orders', new OrderPlacedHandler()));
+(new Kernel())->run((new Router())->on('orders', new OrderPlacedHandler()));
