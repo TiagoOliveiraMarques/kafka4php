@@ -30,7 +30,7 @@ build in which order**; DESIGN.md says **how the system works**.
 | S2 | C SAPI, single thread (`k4p-php-sys`) | S0, S1 | done | Claude Code sub-agent (Opus 5.5), 2026-10-10 |
 | S3 | PHP thread pool + timeouts + recycling (`k4p-php`) | S2 | done | Claude Code (Opus 5.5), 2026-10-17 |
 | S4 | Opcache, preload & per-request cost under ZTS | S2 | todo | |
-| S5 | PHP userland framework (`php/`) | S0 | todo | |
+| S5 | PHP userland framework (`php/`) | S0 | in-progress | Claude Code (Opus 5.5), 2026-10-17 |
 | S6 | Kafka consumer engine + dispatcher (`k4p-host`) | S0, S1 | todo | |
 | S7 | Result actions: produce, retry tiers, DLQ (`k4p-host`) | S6 | todo | |
 | S8 | Binary: config, wiring, signals, health (`kafka4php`) | S3, S7 | todo | |
