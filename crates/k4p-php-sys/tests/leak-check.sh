@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Request-memory leak check for the kafka4php SAPI (PLAN.md S2), against a ZTS *debug*
-# build of PHP (tests/debug-php.Dockerfile). A debug PHP tracks every emalloc() and
-# prints each leak to stderr at request shutdown ("... Freeing 0x... (N bytes) ...");
-# it also enables ZEND_ASSERT()s.
+# build of PHP: the toolchain image built with PHP_DEBUG=1 (docker/dev.Dockerfile). A
+# debug PHP tracks every emalloc() and prints each leak to stderr at request shutdown
+# ("... Freeing 0x... (N bytes) ..."); it also enables ZEND_ASSERT()s.
 #
 # Runs, in the debug image:
 #   1. the `leaks` test (1,000 requests over every fixture/outcome kind),
@@ -13,12 +13,13 @@
 #   crates/k4p-php-sys/tests/leak-check.sh          # from Git Bash or Linux, repo root
 #   PHP_VERSION=8.5 crates/k4p-php-sys/tests/leak-check.sh
 #
-# The debug image takes a few minutes to build the first time.
+# The debug image takes a few minutes to build the first time. CI runs the
+# `--in-container` part directly in the debug image it built (.github/workflows/build.yml).
 set -euo pipefail
 
 leak_pattern='Freeing 0x|memory leaks detected|Last leak repeated|Leaked [0-9]'
 
-if [[ "${K4P_LEAK_CHECK_INNER:-}" == 1 ]]; then
+if [[ "${1:-}" == --in-container ]]; then
     # Inside the debug container, repo at /work.
     php -v | grep -q DEBUG || { echo "leak-check: PHP is not a debug build" >&2; exit 1; }
     cargo build --quiet -p k4p-php-sys --tests
@@ -59,30 +60,6 @@ if [[ "${K4P_LEAK_CHECK_INNER:-}" == 1 ]]; then
     exit $status
 fi
 
-# Host side: build the images, run this script inside the debug image.
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
-php_version="${PHP_VERSION:-8.4}"
-image="kafka4php-dev:php${php_version}-debug"
-
-host_root="$root"
-if command -v cygpath >/dev/null 2>&1; then
-    host_root="$(cygpath -m "$root")"
-    export MSYS_NO_PATHCONV=1
-fi
-
-# Base toolchain image (built/cached by dev.sh), then the debug PHP on top of it.
-PHP_VERSION="$php_version" "$root/scripts/dev.sh" true
-docker build \
-    -f "$host_root/crates/k4p-php-sys/tests/debug-php.Dockerfile" \
-    --build-arg "PHP_VERSION=$php_version" \
-    -t "$image" \
-    "$host_root/crates/k4p-php-sys/tests"
-
-exec docker run --rm -i \
-    -v "$host_root:/work" \
-    -v k4p-cargo-registry:/usr/local/cargo/registry \
-    -v k4p-cargo-git:/usr/local/cargo/git \
-    -v "k4p-target-php${php_version}-debug:/work/target" \
-    -w /work \
-    -e K4P_LEAK_CHECK_INNER=1 \
-    "$image" bash crates/k4p-php-sys/tests/leak-check.sh
+# Host side: run this script inside the debug variant of the toolchain image.
+exec env PHP_DEBUG=1 "$(dirname "${BASH_SOURCE[0]}")/../../../scripts/dev.sh" \
+    bash crates/k4p-php-sys/tests/leak-check.sh --in-container

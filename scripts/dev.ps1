@@ -5,12 +5,15 @@
 #   scripts\dev.ps1 --with-kafka cargo test -p k4p-host
 #   $env:PHP_VERSION = '8.5'; scripts\dev.ps1 php -v
 #
-# Env: PHP_VERSION (default 8.4), K4P_TTY=0|1 to force TTY allocation off/on.
+# Env: PHP_VERSION (default 8.4); PHP_DEBUG=1 for the ZTS debug PHP variant (tests only,
+# image kafka4php-dev:php<ver>-debug); K4P_TTY=0|1 to force TTY allocation off/on.
 $ErrorActionPreference = 'Stop'
 
 $root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $phpVersion = if ($env:PHP_VERSION) { $env:PHP_VERSION } else { '8.4' }
-$image = "kafka4php-dev:php$phpVersion"
+$phpDebug = if ($env:PHP_DEBUG -eq '1') { '1' } else { '0' }
+$variant = if ($phpDebug -eq '1') { "php$phpVersion-debug" } else { "php$phpVersion" }
+$image = "kafka4php-dev:$variant"
 
 $cmd = @($args)
 $withKafka = $false
@@ -19,7 +22,7 @@ if ($cmd.Count -gt 0 -and $cmd[0] -eq '--with-kafka') {
     $cmd = @($cmd | Select-Object -Skip 1)
 }
 
-docker build --quiet -f "$root\docker\dev.Dockerfile" --build-arg "PHP_VERSION=$phpVersion" -t $image $root | Out-Null
+docker build --quiet -f "$root\docker\dev.Dockerfile" --build-arg "PHP_VERSION=$phpVersion" --build-arg "PHP_DEBUG=$phpDebug" -t $image $root | Out-Null
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 $runArgs = @('--rm', '-i')
@@ -40,7 +43,7 @@ docker run @runArgs `
     -v "${root}:/work" `
     -v k4p-cargo-registry:/usr/local/cargo/registry `
     -v k4p-cargo-git:/usr/local/cargo/git `
-    -v "k4p-target-php${phpVersion}:/work/target" `
+    -v "k4p-target-${variant}:/work/target" `
     -w /work `
     -e CARGO_TERM_COLOR `
     -e RUST_BACKTRACE `

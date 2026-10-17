@@ -7,16 +7,21 @@
 #   scripts/dev.sh                                          # interactive shell
 #
 # The repo is mounted at /work. The cargo registry/git caches and target/ live in
-# named Docker volumes (target/ per PHP version, since it links against libphp).
+# named Docker volumes (target/ per image variant, since it links against libphp).
 # With --with-kafka, docker/compose.test.yml is started (and waited for) and the
 # container joins its network, where the broker is `kafka:9092`.
 #
-# Env: PHP_VERSION (default 8.4), K4P_TTY=0|1 to force TTY allocation off/on.
+# Env: PHP_VERSION (default 8.4); PHP_DEBUG=1 for the ZTS debug PHP variant (tests only,
+# image kafka4php-dev:php<ver>-debug); K4P_TTY=0|1 to force TTY allocation off/on.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 php_version="${PHP_VERSION:-8.4}"
-image="kafka4php-dev:php${php_version}"
+variant="php${php_version}"
+if [[ "${PHP_DEBUG:-0}" == 1 ]]; then
+    variant="${variant}-debug"
+fi
+image="kafka4php-dev:${variant}"
 
 with_kafka=0
 if [[ "${1:-}" == "--with-kafka" ]]; then
@@ -35,6 +40,7 @@ fi
 docker build --quiet \
     -f "$host_root/docker/dev.Dockerfile" \
     --build-arg "PHP_VERSION=$php_version" \
+    --build-arg "PHP_DEBUG=${PHP_DEBUG:-0}" \
     -t "$image" \
     "$host_root" >/dev/null
 
@@ -56,7 +62,7 @@ exec docker run "${run_args[@]}" \
     -v "$host_root:/work" \
     -v k4p-cargo-registry:/usr/local/cargo/registry \
     -v k4p-cargo-git:/usr/local/cargo/git \
-    -v "k4p-target-php${php_version}:/work/target" \
+    -v "k4p-target-${variant}:/work/target" \
     -w /work \
     -e CARGO_TERM_COLOR \
     -e RUST_BACKTRACE \

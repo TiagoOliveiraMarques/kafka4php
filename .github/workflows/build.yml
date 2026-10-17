@@ -3,8 +3,8 @@
 # container, as locally with scripts/dev.sh):
 #   build-and-test: image build (incl. docker/php-check.sh), cargo fmt --check, clippy
 #                   -D warnings, cargo test --workspace --all-features.
-#   leak-check:     the k4p-php-sys request-memory leak check against a ZTS debug PHP
-#                   (crates/k4p-php-sys/tests/leak-check.sh, exactly as run locally).
+#   leak-check:     the image with PHP_DEBUG=1 (ZTS debug PHP), running the k4p-php-sys
+#                   request-memory leak check (crates/k4p-php-sys/tests/leak-check.sh).
 name: build
 
 on:
@@ -80,14 +80,34 @@ jobs:
       fail-fast: false
       matrix:
         php: ["8.4", "8.5"]
+    env:
+      IMAGE: kafka4php-dev:php${{ matrix.php }}-debug
     steps:
       - uses: actions/checkout@v7
 
-      # Builds the toolchain image, then the debug PHP on top of it (no layer cache:
-      # the debug image builds FROM the locally built toolchain image), then runs the
-      # leak check in it.
-      - name: crates/k4p-php-sys/tests/leak-check.sh
-        env:
-          PHP_VERSION: ${{ matrix.php }}
-          CARGO_TERM_COLOR: always
-        run: crates/k4p-php-sys/tests/leak-check.sh
+      - uses: docker/setup-buildx-action@v4
+
+      # Same Dockerfile with PHP_DEBUG=1: every layer but the last is shared with the
+      # build-and-test image, so its cache is read too.
+      - name: Build docker/dev.Dockerfile (PHP_DEBUG=1)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: docker/dev.Dockerfile
+          build-args: |
+            PHP_VERSION=${{ matrix.php }}
+            PHP_DEBUG=1
+          tags: ${{ env.IMAGE }}
+          load: true
+          push: false
+          cache-from: |
+            type=gha,scope=dev-image-php${{ matrix.php }}-debug
+            type=gha,scope=dev-image-php${{ matrix.php }}
+          cache-to: type=gha,mode=max,scope=dev-image-php${{ matrix.php }}-debug
+
+      - name: crates/k4p-php-sys/tests/leak-check.sh (in the debug image)
+        run: |
+          docker run --rm \
+            -v "$GITHUB_WORKSPACE:/work" -w /work \
+            -e CARGO_TERM_COLOR=always \
+            "$IMAGE" bash crates/k4p-php-sys/tests/leak-check.sh --in-container

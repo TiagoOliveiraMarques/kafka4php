@@ -728,8 +728,13 @@ logged with `source=php`.
   based on `php:<ver>-zts-bookworm`. PHP must be ZTS + embed (`libphp.so`) + Zend
   max execution timers, with OPcache loaded. The official ZTS images ship exactly
   that (`--enable-embed --enable-zts`; timers default on with ZTS), so PHP is used
-  **as is** — never rebuilt. `docker/php-check.sh` runs first and **fails the
-  build** if any of these is missing. Plus the Rust toolchain pinned by
+  **as is** — never rebuilt to fix a missing feature. `docker/php-check.sh` runs
+  first and **fails the build** if any of these is missing. The one explicit,
+  test-only exception: `--build-arg PHP_DEBUG=1` (last layer,
+  `docker/php-debug-build.sh`) rebuilds the same PHP source with the same flags plus
+  `--enable-debug --enable-zend-test` for the leak check; `scripts/dev.sh` selects
+  it with `PHP_DEBUG=1` (image `kafka4php-dev:php<ver>-debug`, own `target/`
+  volume). Plus the Rust toolchain pinned by
   `rust-toolchain.toml`, cmake,
   clang/libclang (bindgen), pkg-config, OpenSSL/zstd/SASL headers, Composer.
   All builds and tests run inside it via `scripts/dev.sh` (Git Bash/Linux) or
@@ -774,7 +779,7 @@ logged with `source=php`.
 | Layer | How |
 |---|---|
 | `k4p-core` | Unit tests. |
-| `k4p-php-sys` / `k4p-php` | Rust tests in the toolchain container running real PHP scripts (`crates/k4p-php-sys/tests/fixtures/`, `crates/k4p-php/tests/fixtures/`): every outcome kind, binary-safe data round-trip, memory stability over ≥100k requests (RSS and `memory_get_usage` baseline stable), N-thread concurrency, recycling, soft and hard timeouts, abandoned-thread replacement. PHP can be started once per process, so these test binaries use `harness = false` with their own runner (init on the main thread, cases on a PHP worker thread). `crates/k4p-php-sys/tests/leak-check.sh` re-runs the SAPI tests on a ZTS **debug** PHP (`tests/debug-php.Dockerfile`) and fails on any reported request-memory leak, with a positive control. |
+| `k4p-php-sys` / `k4p-php` | Rust tests in the toolchain container running real PHP scripts (`crates/k4p-php-sys/tests/fixtures/`, `crates/k4p-php/tests/fixtures/`): every outcome kind, binary-safe data round-trip, memory stability over ≥100k requests (RSS and `memory_get_usage` baseline stable), N-thread concurrency, recycling, soft and hard timeouts, abandoned-thread replacement. PHP can be started once per process, so these test binaries use `harness = false` with their own runner (init on the main thread, cases on a PHP worker thread). `crates/k4p-php-sys/tests/leak-check.sh` re-runs the SAPI tests on a ZTS **debug** PHP (the `PHP_DEBUG=1` variant of the toolchain image) and fails on any reported request-memory leak, with a positive control. |
 | `k4p-host` | Unit tests with a `FakeExecutor` (scripted outcomes, delays). Integration tests against a real Kafka from `docker/compose.test.yml`: offsets, retry tiers & due-time, DLQ, max attempts, rebalance with in-flight messages, produce-failure blocking, backpressure. |
 | `php/` | PHPUnit + PHPStan (max level) using `FakeNativeBridge`. Runs on stock `php:8.x-cli`. |
 | CI | `.github/workflows/build.yml`, every PR and push to `main`, PHP 8.4 and 8.5: builds the toolchain image, runs `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace --all-features` in it, and the debug-PHP leak check. Every test suite must run there. |

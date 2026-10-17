@@ -162,9 +162,8 @@ cargo inside it from a Windows host.
   is **not rebuilt**: `docker/php-check.sh` verifies those and fails the image build
   if any is missing (review decision on PR #2: fail loudly rather than diverge from
   the base image).
-- **S2:** the dev image has no debug PHP. A ZTS debug build for the leak check
-  has to come from a separate, test-only Dockerfile, or the check is documented
-  as infeasible (as the S2 criteria allow).
+- **S2 (updated in S2's review):** a ZTS debug PHP is available as an opt-in variant
+  of the same image: `--build-arg PHP_DEBUG=1` / `PHP_DEBUG=1 scripts/dev.sh …`.
   Headers: `php-config --includes`; `sapi/embed/php_embed.h` is installed.
 - **CI:** `.github/workflows/build.yml`, on every PR and push to `main`, for PHP 8.4
   and 8.5: `build and test` builds the image (GitHub Actions cache per version) and
@@ -268,8 +267,8 @@ outcome classification and no per-request memory growth. Highest-risk step.
   `InitError`, `runtime_init`/`runtime_shutdown` (unsafe), `thread_init`,
   `thread_shutdown`, `execute`; the C conversions are private), fixtures in
   `tests/fixtures/`, tests `sapi`,
-  `memory`, `leaks`, and the debug-PHP leak check (`tests/leak-check.sh` +
-  `tests/debug-php.Dockerfile`).
+  `memory`, `leaks`, and the debug-PHP leak check (`tests/leak-check.sh`, which runs
+  in the `PHP_DEBUG=1` variant of the toolchain image: `docker/php-debug-build.sh`).
 - **The final C ABI, thread-local design, INI handling and log callback contract are
   in DESIGN.md §5.1.1**; validation rules in §5.2, classification in §5.3. Read
   those rather than this summary.

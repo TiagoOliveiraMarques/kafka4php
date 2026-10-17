@@ -2,3 +2,4 @@
 *
 !rust-toolchain.toml
 !docker/php-check.sh
+!docker/php-debug-build.sh
