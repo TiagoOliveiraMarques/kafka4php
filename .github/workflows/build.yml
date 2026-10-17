@@ -5,6 +5,8 @@
 #                   -D warnings, cargo test --workspace --all-features.
 #   leak-check:     the image with PHP_DEBUG=1 (ZTS debug PHP), running the k4p-php-sys
 #                   request-memory leak check (crates/k4p-php-sys/tests/leak-check.sh).
+#   php-framework:  the PHP framework (php/): PHPUnit + PHPStan on stock php:<ver>-cli
+#                   via scripts/php-test.sh (no toolchain image).
 name: build
 
 on:
@@ -111,3 +113,18 @@ jobs:
             -v "$GITHUB_WORKSPACE:/work" -w /work \
             -e CARGO_TERM_COLOR=always \
             "$IMAGE" bash crates/k4p-php-sys/tests/leak-check.sh --in-container
+
+  php-framework:
+    name: php framework (PHP ${{ matrix.php }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: composer test and stan (scripts/php-test.sh, on php:${{ matrix.php }}-cli)
+        env:
+          PHP_VERSION: ${{ matrix.php }}
+        run: scripts/php-test.sh

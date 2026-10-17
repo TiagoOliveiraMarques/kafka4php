@@ -30,7 +30,7 @@ build in which order**; DESIGN.md says **how the system works**.
 | S2 | C SAPI, single thread (`k4p-php-sys`) | S0, S1 | done | Claude Code sub-agent (Opus 5.5), 2026-10-10 |
 | S3 | PHP thread pool + timeouts + recycling (`k4p-php`) | S2 | done | Claude Code (Opus 5.5), 2026-10-17 |
 | S4 | Opcache, preload & per-request cost under ZTS | S2 | todo | |
-| S5 | PHP userland framework (`php/`) | S0 | in-progress | Claude Code (Opus 5.5), 2026-10-17 |
+| S5 | PHP userland framework (`php/`) | S0 | done | Claude Code (Opus 5.5), 2026-10-17 |
 | S6 | Kafka consumer engine + dispatcher (`k4p-host`) | S0, S1 | todo | |
 | S7 | Result actions: produce, retry tiers, DLQ (`k4p-host`) | S6 | todo | |
 | S8 | Binary: config, wiring, signals, health (`kafka4php`) | S3, S7 | todo | |
@@ -572,7 +572,35 @@ make honest throughput claims.
   both modes; handler returning wrong type.
 - No dependency other than PHP itself at runtime.
 
-**Handoff notes:** _(fill in when done)_
+**Handoff notes:**
+- **Built:** `php/` — composer package `kafka4php/framework` (`require`: only
+  `php >=8.4`; dev: PHPUnit 12, PHPStan 2). `src/`: `NativeBridge` (+ the §5.2 shapes
+  as PHPStan type aliases), `NativeFunctionsBridge`, `Message`, `Headers`,
+  `OutboundMessage`, `Result\{Result,NoContent,Content,Fail,RetryLater}`, `Handler`,
+  `Router`, `Kernel`, `ExceptionPolicy` (enum), internal `CallableHandler`,
+  `Testing\{MessageBuilder,FakeNativeBridge}`; `stubs/native.php`; `README.md`.
+  As-built API in DESIGN.md §5.4.
+- **Deviations (DESIGN.md §5.4 updated):** `Kernel::run(Handler|callable, ?NativeBridge,
+  ExceptionPolicy $onException = ExceptionPolicy::RetryLater)` — `Router` implements
+  `Handler`, so `Router` is no longer a separate union member; the exception policy is
+  the third parameter. Exception reason is `"<FQCN>: <message>"`; `Fail` mode sets
+  `error_class` to the FQCN. A callable returning a non-`Result` throws `\TypeError`
+  (same class PHP throws for a `Handler` returning the wrong type) and goes through
+  the policy. `Headers::has()` added. Router: duplicate topic →
+  `\InvalidArgumentException`; unknown → `Fail('no handler for topic "X"')` (quoted).
+- **No PHP-side validation:** results are not re-validated (C does it, §5.2), and
+  `FakeNativeBridge` records results unvalidated — an invalid result (e.g. empty topic)
+  only shows up against the real SAPI.
+- **Checks:** `scripts/php-test.sh` (`PHP_VERSION=8.4|8.5`): `composer install` in
+  `composer:2.8` into `php/vendor/` (platform pinned to 8.4.0), then `composer test`
+  + `composer stan` on stock `php:<ver>-cli`. 39 tests, PHPStan max clean, on PHP
+  8.4.26 and 8.5.11. CI: new `php-framework` job (matrix 8.4/8.5) in
+  `.github/workflows/build.yml`. No PowerShell wrapper — run it from Git Bash.
+  `php/composer.lock` is gitignored (library).
+- **For S9:** `NativeFunctionsBridge` / the stubs have only been checked against the C
+  sources (keys and shapes), never executed inside the SAPI — the example app's E2E
+  is the first real run. The entrypoint needs `vendor/autoload.php` (composer install
+  in the image).
 
 **Notes from other steps:** _(none yet)_
 
@@ -760,6 +788,10 @@ covering DESIGN.md §9's E2E scenarios.
 - From S2 (decision): no OPcache on PHP 8.4 under SAPI `kafka4php` (DESIGN.md §5.1). The
   example app's preload script and any OPcache/preload E2E checks only apply to the 8.5
   image; the 8.4 E2E run must not depend on OPcache.
+- From S5: the framework (`php/`) has never run inside the SAPI — only unit-tested
+  with `FakeNativeBridge`. The example app should use `Kernel::run()` with the default
+  `NativeFunctionsBridge`, so the E2E covers it; include one invalid `Content` (e.g.
+  empty topic), since PHP doesn't validate results — C does (§5.2).
 
 ---
 

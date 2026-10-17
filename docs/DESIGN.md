@@ -471,24 +471,56 @@ After the script and the shutdown functions ran, still inside the request:
 
 ### 5.4 Userland framework: `kafka4php/framework` (composer, in `php/`)
 
-Namespace `Kafka4php\`. Pure PHP, no runtime dependency on the native functions
-(they're reached through a `NativeBridge` interface so everything is unit-testable
-with plain PHPUnit).
+Namespace `Kafka4php\`. Pure PHP ≥ 8.4, no runtime dependency (composer `require`
+is only `php`) — not even on the native functions: they're reached through a
+`NativeBridge` interface so everything is unit-testable with plain PHPUnit.
 
+- `NativeBridge` — `message(): array`, `result(array): void`. Its PHPStan type aliases
+  (`NativeMessage`, `NativeOutbound`, `NativeHeaders`, `NativeResult`) are the §5.2
+  shapes, and the only PHP that knows them is `Message::fromNative()` (reading),
+  the `toNative()` methods of the results and `OutboundMessage` (writing) and
+  `Testing\MessageBuilder::toNative()` (playing the C side). The framework trusts
+  `message()` to match its shape and does not re-validate results — the C side is the
+  validator (`\ValueError`, §5.2). `NativeFunctionsBridge` calls `\Kafka4php\Native\*`.
 - `Message` — readonly: `topic`, `deliveryTopic`, `partition`, `offset`,
-  `timestampMs`, `key`, `value`, `headers` (`Headers` object: `get(name): ?string`
-  first match, `all(name): list`, `toList()`), `attempt`.
-- `Result\Result` (interface) with `Result\NoContent`, `Result\Content(OutboundMessage ...$messages)`,
+  `timestampMs`, `key`, `value`, `headers`, `attempt`. `Headers` (readonly, ordered,
+  duplicates allowed, exact-case names): `get(name): ?string` first match,
+  `has(name)`, `all(name): list<?string>`, `toList()` (`[name, value]` pairs, the
+  shape `OutboundMessage` takes, so inbound headers can be forwarded).
+- `Result\Result` (interface, `toNative()` is `@internal`; not meant to be
+  implemented by users) with `Result\NoContent`, `Result\Content(OutboundMessage ...$messages)`,
   `Result\Fail(string $reason, ?string $errorClass = null)`, `Result\RetryLater(string $reason)`.
+  All final readonly classes; `toNative()` always emits the optional keys
+  (`key`, `headers`, `partition`, `error_class`), null/`[]` when unset.
 - `OutboundMessage(string $topic, ?string $value, ?string $key = null, array $headers = [], ?int $partition = null)`.
 - `Handler` interface: `handle(Message $message): Result`.
-- `Router` — maps logical topic → `Handler`. Unknown topic → `Fail("no handler for topic X")`.
-- `Kernel::run(Handler|Router|callable $handler, ?NativeBridge $bridge = null): void` —
-  reads the message, invokes the handler, catches `Throwable` (default:
-  `RetryLater` with the exception class/message; configurable to `Fail`), calls
-  `result()`.
-- `Testing\` — `FakeNativeBridge`, `MessageBuilder` for handler unit tests.
-- `stubs/native.php` — stubs for `Kafka4php\Native\*` for IDEs / PHPStan.
+- `Router implements Handler` — `on(topic, Handler|callable): self` maps a logical
+  topic (`Message::$topic`, so retries reach the same handler) to a handler; a second
+  handler for a topic is an `\InvalidArgumentException`. Unknown topic →
+  `Fail('no handler for topic "X"')`.
+- `Kernel::run(Handler|callable $handler, ?NativeBridge $bridge = null, ExceptionPolicy $onException = ExceptionPolicy::RetryLater): void`
+  (`null` bridge = `NativeFunctionsBridge`) — reads the message, invokes the handler,
+  catches any `Throwable` from it and maps it with the `ExceptionPolicy` enum, then
+  calls `result()` exactly once. `ExceptionPolicy::RetryLater` (default) →
+  `RetryLater("<class>: <message>")`; `ExceptionPolicy::Fail` →
+  `Fail("<class>: <message>", errorClass: <class>)` (`<class>` fully qualified).
+  Callables (`callable(Message): Result`) are adapted by the internal
+  `CallableHandler`; one returning anything but a `Result` throws a `\TypeError`
+  (as PHP does for a `Handler` class), which goes through the policy too. Exceptions
+  outside the handler (e.g. `message()` outside a request) are not caught.
+- `Testing\MessageBuilder` — immutable builder:
+  `MessageBuilder::forTopic('orders')->withValue(..)->withHeader(..)->build()`;
+  defaults partition 0, offset 0, no timestamp/key/value/headers, attempt 1,
+  `delivery_topic` = topic. `Testing\FakeNativeBridge(MessageBuilder)` serves that
+  message and records every reported result array (`results()`), unvalidated.
+- `stubs/native.php` — stubs for `Kafka4php\Native\*` for IDEs / PHPStan
+  (`scanFiles`, never loaded at runtime).
+- Checks: `composer test` (PHPUnit 12, fails on warnings/risky/skipped) and
+  `composer stan` (PHPStan 2, level max, `src` + `tests`), run on stock
+  `php:<ver>-cli` by `scripts/php-test.sh` (`PHP_VERSION`, default 8.4): `composer
+  install` in the `composer` image (`config.platform.php` = 8.4.0, so one `vendor/`
+  serves every version), then both scripts with the PHP under test.
+  `composer.lock` is not committed (library).
 
 Typical entrypoint (executed once per message):
 
@@ -826,8 +858,8 @@ logged with `source=php`.
 | `k4p-core` | Unit tests. |
 | `k4p-php-sys` / `k4p-php` | Rust tests in the toolchain container running real PHP scripts (`crates/k4p-php-sys/tests/fixtures/`, `crates/k4p-php/tests/fixtures/`): every outcome kind, binary-safe data round-trip, memory stability over ≥100k requests (RSS and `memory_get_usage` baseline stable), N-thread concurrency, recycling, soft and hard timeouts, abandoned-thread replacement. PHP can be started once per process, so these test binaries use `harness = false` with their own runner (init on the main thread, cases on a PHP worker thread). `crates/k4p-php-sys/tests/leak-check.sh` re-runs the SAPI tests on a ZTS **debug** PHP (the `PHP_DEBUG=1` variant of the toolchain image) and fails on any reported request-memory leak, with a positive control. |
 | `k4p-host` | Unit tests with a `FakeExecutor` (scripted outcomes, delays). Integration tests against a real Kafka from `docker/compose.test.yml`: offsets, retry tiers & due-time, DLQ, max attempts, rebalance with in-flight messages, produce-failure blocking, backpressure. |
-| `php/` | PHPUnit + PHPStan (max level) using `FakeNativeBridge`. Runs on stock `php:8.x-cli`. |
-| CI | `.github/workflows/build.yml`, every PR and push to `main`, PHP 8.4 and 8.5: builds the toolchain image, runs `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace --all-features` in it, and the debug-PHP leak check. Every test suite must run there. |
+| `php/` | PHPUnit + PHPStan (max level) using `FakeNativeBridge`. Runs on stock `php:8.x-cli` via `scripts/php-test.sh` (§5.4). |
+| CI | `.github/workflows/build.yml`, every PR and push to `main`, PHP 8.4 and 8.5: builds the toolchain image, runs `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace --all-features` in it, the debug-PHP leak check, and `scripts/php-test.sh` (no toolchain image). Every test suite must run there. |
 | E2E | `tests/e2e/`: production image + Kafka + `examples/basic`. Scenarios: happy path, `Content` produce, `Fail`→DLQ, retry→eventual success, max attempts→DLQ, uncaught exception, fatal error, soft/hard timeout, process crash (`posix_kill(getmypid(), SIGSEGV)`) then restart with static membership (no rebalance observed), graceful SIGTERM (no message lost or double-produced beyond at-least-once). |
 
 ---
