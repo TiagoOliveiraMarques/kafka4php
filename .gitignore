@@ -6,3 +6,4 @@ php/vendor/
 *.swp
 .DS_Store
 .ci-cargo-home/
+php/composer.lock

@@ -514,24 +514,61 @@ After the script and the shutdown functions ran, still inside the request:
 
 ### 5.4 Userland framework: `kafka4php/framework` (composer, in `php/`)
 
-Namespace `Kafka4php\`. Pure PHP, no runtime dependency on the native functions
-(they're reached through a `NativeBridge` interface so everything is unit-testable
-with plain PHPUnit).
+Namespace `Kafka4php\`. Pure PHP ≥ 8.4, no runtime dependency (composer `require`
+is only `php`) — not even on the native functions: they're reached through a
+`NativeBridge` interface so everything is unit-testable with plain PHPUnit.
 
+- `NativeBridge` — `message(): array`, `result(array): void`. Its PHPStan type aliases
+  (`NativeMessage`, `NativeOutbound`, `NativeHeaders`, `NativeResult`) are the §5.2
+  shapes, and the only PHP that knows them is `Message::fromNative()` (reading),
+  the `toNative()` methods of the results and `OutboundMessage` (writing) and
+  `Testing\MessageBuilder::toNative()` (playing the C side). The framework trusts
+  `message()` to match its shape and does not re-validate results — the C side is the
+  validator (`\ValueError`, §5.2). `NativeFunctionsBridge` calls `\Kafka4php\Native\*`.
 - `Message` — readonly: `topic`, `deliveryTopic`, `partition`, `offset`,
-  `timestampMs`, `key`, `value`, `headers` (`Headers` object: `get(name): ?string`
-  first match, `all(name): list`, `toList()`), `attempt`.
-- `Result\Result` (interface) with `Result\NoContent`, `Result\Content(OutboundMessage ...$messages)`,
+  `timestampMs`, `key`, `value`, `headers`, `attempt`. `Headers` (readonly, ordered,
+  duplicates allowed, exact-case names): `get(name): ?string` first match,
+  `has(name)`, `all(name): list<?string>`, `toList()` (`[name, value]` pairs, the
+  shape `OutboundMessage` takes, so inbound headers can be forwarded).
+- `Result\Result` (interface, `toNative()` is `@internal`; not meant to be
+  implemented by users) with `Result\NoContent`, `Result\Content(OutboundMessage ...$messages)`,
   `Result\Fail(string $reason, ?string $errorClass = null)`, `Result\RetryLater(string $reason)`.
+  All final readonly classes; `toNative()` always emits the optional keys
+  (`key`, `headers`, `partition`, `error_class`), null/`[]` when unset.
 - `OutboundMessage(string $topic, ?string $value, ?string $key = null, array $headers = [], ?int $partition = null)`.
-- `Handler` interface: `handle(Message $message): Result`.
-- `Router` — maps logical topic → `Handler`. Unknown topic → `Fail("no handler for topic X")`.
-- `Kernel::run(Handler|Router|callable $handler, ?NativeBridge $bridge = null): void` —
-  reads the message, invokes the handler, catches `Throwable` (default:
-  `RetryLater` with the exception class/message; configurable to `Fail`), calls
-  `result()`.
-- `Testing\` — `FakeNativeBridge`, `MessageBuilder` for handler unit tests.
-- `stubs/native.php` — stubs for `Kafka4php\Native\*` for IDEs / PHPStan.
+- A **handler** is any `callable(Message): Result`. `Handler` is the interface for
+  handler classes: `__invoke(Message $message): Result`, so the framework never
+  adapts anything — it just calls handlers.
+- `Router implements Handler` — `on(topic, callable): self` maps a logical topic
+  (`Message::$topic`, so retries reach the same handler) to a handler; a second
+  handler for a topic is an `\InvalidArgumentException`. Unknown topic →
+  `Fail('no handler for topic "X"')`. Being a handler, a router can be nested.
+- `Kernel` (final readonly) — configured by its constructor:
+  `new Kernel(NativeBridge $bridge = new NativeFunctionsBridge(), ExceptionPolicy $onException = ExceptionPolicy::RetryLater)`.
+  `run(callable $handler): void` reads the message, calls the handler, catches any
+  `Throwable` from it and maps it with the `ExceptionPolicy` enum, then calls
+  `result()` exactly once. `ExceptionPolicy::RetryLater` (default) →
+  `RetryLater("<class>: <message>")`; `ExceptionPolicy::Fail` →
+  `Fail("<class>: <message>", errorClass: <class>)` (`<class>` fully qualified).
+  A handler returning anything but a `Result` is caught by PHP's own return type
+  checks — the `Result` return type of `Handler::__invoke` / `Router::__invoke`, or
+  for an untyped callable that of the `Kernel` method calling it — as a `\TypeError`,
+  which goes through the policy too. Exceptions outside the handler (e.g. `message()`
+  outside a request) are not caught.
+- `Testing\MessageBuilder` — mutable fluent builder (each `with*()` sets a field and
+  returns it): `MessageBuilder::forTopic('orders')->withValue(..)->withHeader(..)->build()`;
+  defaults partition 0, offset 0, no timestamp/key/value/headers, attempt 1,
+  `delivery_topic` = topic. `Testing\FakeNativeBridge(MessageBuilder)` serves the
+  message as built at construction and records every reported result array
+  (`results()`), unvalidated.
+- `stubs/native.php` — stubs for `Kafka4php\Native\*` for IDEs / PHPStan
+  (`scanFiles`, never loaded at runtime).
+- Checks: `composer test` (PHPUnit 12, fails on warnings/risky/skipped) and
+  `composer stan` (PHPStan 2, level max, `src` + `tests`), run on stock
+  `php:<ver>-cli` by `scripts/php-test.sh` (`PHP_VERSION`, default 8.4): `composer
+  install` in the `composer` image (`config.platform.php` = 8.4.0, so one `vendor/`
+  serves every version), then both scripts with the PHP under test.
+  `composer.lock` is not committed (library).
 
 Typical entrypoint (executed once per message):
 
@@ -542,7 +579,7 @@ require __DIR__ . '/vendor/autoload.php';
 use Kafka4php\Kernel;
 use Kafka4php\Router;
 
-Kernel::run((new Router())
+(new Kernel())->run((new Router())
     ->on('orders', new App\OrderPlacedHandler())
     ->on('payments', new App\PaymentHandler()));
 ```
@@ -631,28 +668,36 @@ Per-request cost of the SAPI on **one PHP thread**, sequential requests, measure
 `cargo bench -p k4p-php-sys --bench request_cost` (median of 3 runs × 50,000 requests
 per row, after 1,000 warm-up requests; scripts on the container's own filesystem).
 Scenarios: `empty` = an entrypoint that only calls `result()` (the host + request
-lifecycle floor); `kernel` = a typical entrypoint: composer autoloader
-(`dump-autoload --optimize`), a stand-in for `Kernel::run` + `Router` (§5.4) and a
-trivial handler (decode a small JSON value, return `NoContent`), ~15 classes per
-request; `preload` = `kernel` with all app classes in `opcache.preload`. OPcache `on` =
-PHP defaults, `on-vt0` = plus `opcache.validate_timestamps=0`.
+lifecycle floor); `kernel` = a typical entrypoint: composer autoloader (optimized),
+the real `kafka4php/framework` `Kernel::run` + `Router` (§5.4) and a trivial handler
+(decode a small JSON value, return `NoContent`), ~14 classes per request (10 of the
+framework); `preload` = `kernel` with all app and framework classes in
+`opcache.preload`. OPcache `on` = PHP defaults, `on-vt0` = plus
+`opcache.validate_timestamps=0`.
 
 | scenario | OPcache | req/s | mean µs | p50 µs | p99 µs |
 |---|---|---:|---:|---:|---:|
-| empty | off (8.4) | 49,452 | 20.2 | 18.1 | 50.7 |
-| empty | off (8.5) | 47,766 | 20.9 | 18.7 | 53.9 |
-| empty | on | 92,894 | 10.8 | 9.8 | 30.8 |
-| empty | on-vt0 | 93,338 | 10.7 | 9.8 | 24.9 |
-| kernel | off (8.4) | 1,485 | 673.3 | 642.1 | 1,128.2 |
-| kernel | off (8.5) | 1,458 | 685.9 | 646.3 | 1,232.5 |
-| kernel | on | 36,745 | 27.2 | 24.8 | 66.7 |
-| kernel | on-vt0 | 36,827 | 27.2 | 24.6 | 67.6 |
-| preload | on | 48,441 | 20.6 | 18.9 | 54.5 |
-| preload | on-vt0 | 48,058 | 20.8 | 18.9 | 55.0 |
+| empty | off (8.4) | 44,955 | 22.2 | 19.3 | 63.2 |
+| empty | off (8.5) | 43,524 | 23.0 | 20.5 | 60.3 |
+| empty | on | 88,480 | 11.3 | 10.4 | 25.8 |
+| empty | on-vt0 | 89,217 | 11.2 | 10.0 | 32.3 |
+| kernel | off (8.4) | 1,137 | 879.2 | 845.6 | 1,479.8 |
+| kernel | off (8.5) | 1,133 | 882.7 | 857.7 | 1,378.6 |
+| kernel | on | 30,238 | 33.1 | 30.1 | 77.6 |
+| kernel | on-vt0 | 30,271 | 33.0 | 30.2 | 83.1 |
+| preload | on | 43,152 | 23.2 | 21.0 | 64.5 |
+| preload | on-vt0 | 41,665 | 24.0 | 21.4 | 68.6 |
 
-`on` rows are PHP 8.5.11 (8.4.26 has no OPcache under our SAPI, §5.1).
+`on` rows are PHP 8.5.11 (8.4.26 has no OPcache under our SAPI, §5.1). The first
+recording (S4) ran `kernel` on a smaller stand-in framework (9 classes, half the
+source): 27.2 µs with OPcache, 673 µs without, 20.6 µs preloaded, on an `empty`
+floor of 10.8 / 20.2 µs. This machine's floor varies by ~5–10% between sessions
+(here 11.3 / 22.2 µs, reproduced by a second 8.5 run), so compare `kernel` above the
+floor: the real framework (one more class, the `ExceptionPolicy` enum loaded for the
+`Kernel` constructor's default; twice the source, mostly docblocks) costs ~5 µs more
+with OPcache (22 vs 16 µs above the floor) and ~200 µs more without.
 
-**System** (run 2026-10-17; the bench prints the container-side lines itself):
+**System** (all recordings 2026-10-17; the bench prints the container-side lines itself):
 
 - Host: ASUS ROG Zephyrus G14 (GA401IU) laptop, **on AC power**, Windows 11 Home
   (10.0.26200), power plan "High performance".
@@ -664,15 +709,15 @@ PHP defaults, `on-vt0` = plus `opcache.validate_timestamps=0`.
   containers running.
 
 **Run-to-run variance:** the same machine on battery power measured every row ~3×
-slower (e.g. `kernel`/on 82 µs, `kernel`/off 2.1 ms) with wider tails; the ratios
+slower (S4 stand-in: `kernel`/on 82 µs, `kernel`/off 2.1 ms) with wider tails; the ratios
 below held in every run and are the claims to rely on:
 
 - **OPcache is the lever that matters.** Without it a typical entrypoint recompiles
   every file it includes on every message: `kernel` is **~25× slower** than with
-  OPcache (≈ 1.5k msg/s per thread vs ≈ 37k here). This is the cost of PHP 8.4 (§5.1).
+  OPcache (≈ 1.1k msg/s per thread vs ≈ 30k here). This is the cost of PHP 8.4 (§5.1).
 - The host + request lifecycle floor (`empty`, OPcache on) is ~11 µs per message
   (≈ 90k msg/s per thread); OPcache halves even that.
-- **Preload** saves ~25% over `kernel` with ~15 classes per message (27 → 21 µs); it
+- **Preload** saves ~30% over `kernel` with ~15 classes per message (33 → 23 µs); it
   pays more the more classes a message loads.
 - `validate_timestamps=0` is within run-to-run noise from a local filesystem (it saves
   `stat()` calls, which matter on slow filesystems: on the Docker Desktop bind mount
@@ -927,8 +972,8 @@ logged with `source=php`.
 | `k4p-core` | Unit tests. |
 | `k4p-php-sys` / `k4p-php` | Rust tests in the toolchain container running real PHP scripts (`crates/k4p-php-sys/tests/fixtures/`, `crates/k4p-php/tests/fixtures/`): every outcome kind, binary-safe data round-trip, memory stability over ≥100k requests (RSS and `memory_get_usage` baseline stable), N-thread concurrency, recycling, soft and hard timeouts, abandoned-thread replacement. PHP can be started once per process, so these test binaries use `harness = false` with their own runner (init on the main thread, cases on a PHP worker thread). `crates/k4p-php-sys/tests/leak-check.sh` re-runs the SAPI tests on a ZTS **debug** PHP (the `PHP_DEBUG=1` variant of the toolchain image) and fails on any reported request-memory leak, with a positive control. `k4p-php-sys` tests `opcache` (8.5: OPcache active, preloaded class/function visible without autoload, tracing JIT on and ≥ 100k requests on 4 threads; 8.4: OPcache loaded but inactive, so a PHP change is noticed) and `default_ini` (§5.1.2 values and precedence). The benchmark `cargo bench -p k4p-php-sys --bench request_cost` produces the §5.7 table. |
 | `k4p-host` | Unit tests with a `FakeExecutor` (scripted outcomes, delays). Integration tests against a real Kafka from `docker/compose.test.yml`: offsets, retry tiers & due-time, DLQ, max attempts, rebalance with in-flight messages, produce-failure blocking, backpressure. |
-| `php/` | PHPUnit + PHPStan (max level) using `FakeNativeBridge`. Runs on stock `php:8.x-cli`. |
-| CI | `.github/workflows/build.yml`, every PR and push to `main`, PHP 8.4 and 8.5: builds the toolchain image, runs `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace --all-features` in it, and the debug-PHP leak check. Every test suite must run there. |
+| `php/` | PHPUnit + PHPStan (max level) using `FakeNativeBridge`. Runs on stock `php:8.x-cli` via `scripts/php-test.sh` (§5.4). |
+| CI | `.github/workflows/build.yml`, every PR and push to `main`, PHP 8.4 and 8.5: builds the toolchain image, runs `cargo fmt --check`, clippy `-D warnings`, `cargo test --workspace --all-features` in it, the debug-PHP leak check, and `scripts/php-test.sh` (no toolchain image). Every test suite must run there. |
 | E2E | `tests/e2e/`: production image + Kafka + `examples/basic`. Scenarios: happy path, `Content` produce, `Fail`→DLQ, retry→eventual success, max attempts→DLQ, uncaught exception, fatal error, soft/hard timeout, process crash (`posix_kill(getmypid(), SIGSEGV)`) then restart with static membership (no rebalance observed), graceful SIGTERM (no message lost or double-produced beyond at-least-once). |
 
 ---

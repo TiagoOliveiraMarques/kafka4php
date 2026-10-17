@@ -1,0 +1,8 @@
+parameters:
+    level: max
+    paths:
+        - src
+        - tests
+    # The native functions exist only inside the kafka4php SAPI.
+    scanFiles:
+        - stubs/native.php

@@ -30,7 +30,7 @@ build in which order**; DESIGN.md says **how the system works**.
 | S2 | C SAPI, single thread (`k4p-php-sys`) | S0, S1 | done | Claude Code sub-agent (Opus 5.5), 2026-10-10 |
 | S3 | PHP thread pool + timeouts + recycling (`k4p-php`) | S2 | done | Claude Code (Opus 5.5), 2026-10-17 |
 | S4 | Opcache, preload & per-request cost under ZTS | S2 | done | Claude Code (Opus 5.5), 2026-10-17 |
-| S5 | PHP userland framework (`php/`) | S0 | todo | |
+| S5 | PHP userland framework (`php/`) | S0 | done | Claude Code (Opus 5.5), 2026-10-17 |
 | S6 | Kafka consumer engine + dispatcher (`k4p-host`) | S0, S1 | todo | |
 | S7 | Result actions: produce, retry tiers, DLQ (`k4p-host`) | S6 | todo | |
 | S8 | Binary: config, wiring, signals, health (`kafka4php`) | S3, S7 | todo | |
@@ -625,7 +625,48 @@ make honest throughput claims.
   both modes; handler returning wrong type.
 - No dependency other than PHP itself at runtime.
 
-**Handoff notes:** _(fill in when done)_
+**Handoff notes:**
+- **Built:** `php/` — composer package `kafka4php/framework` (`require`: only
+  `php >=8.4`; dev: PHPUnit 12, PHPStan 2). `src/`: `NativeBridge` (+ the §5.2 shapes
+  as PHPStan type aliases), `NativeFunctionsBridge`, `Message`, `Headers`,
+  `OutboundMessage`, `Result\{Result,NoContent,Content,Fail,RetryLater}`, `Handler`,
+  `Router`, `Kernel`, `ExceptionPolicy` (enum),
+  `Testing\{MessageBuilder,FakeNativeBridge}`; `stubs/native.php`; `README.md`.
+  As-built API in DESIGN.md §5.4.
+- **Deviations (DESIGN.md §5.4 updated; reshaped by PR review):** handlers are plain
+  `callable(Message): Result` — `Handler` declares `__invoke` (not `handle`), `Router`
+  implements it, and nothing adapts callables. `Kernel` is configured by its
+  constructor (`new Kernel(NativeBridge = new NativeFunctionsBridge(), ExceptionPolicy
+  = RetryLater)`) and run with `->run($handler)`; entrypoints write
+  `(new Kernel())->run($router)`. Exception reason is `"<FQCN>: <message>"`; `Fail`
+  mode sets `error_class` to the FQCN. A non-`Result` return is PHP's own return-type
+  `\TypeError` (from the handler's `__invoke`, the Router's, or the Kernel's private
+  `resultOf()` for untyped callables) and goes through the policy. `MessageBuilder`
+  is mutable. `Headers::has()` added. Router: duplicate topic →
+  `\InvalidArgumentException`; unknown → `Fail('no handler for topic "X"')` (quoted).
+- **No PHP-side validation:** results are not re-validated (C does it, §5.2), and
+  `FakeNativeBridge` records results unvalidated — an invalid result (e.g. empty topic)
+  only shows up against the real SAPI.
+- **Checks:** `scripts/php-test.sh` (`PHP_VERSION=8.4|8.5`): `composer install` in
+  `composer:2.8` into `php/vendor/` (platform pinned to 8.4.0), then `composer test`
+  + `composer stan` on stock `php:<ver>-cli`. 39 tests, PHPStan max clean, on PHP
+  8.4.26 and 8.5.11. CI: new `php-framework` job (matrix 8.4/8.5) in
+  `.github/workflows/build.yml`. No PowerShell wrapper — run it from Git Bash.
+  `php/composer.lock` is gitignored (library).
+- **Benchmark (S4's note, done):** `crates/k4p-php-sys/benches/app/` now requires
+  `kafka4php/framework` (path repository `../framework`, Packagist disabled) and its
+  stand-in `src/Framework/` is gone. The bench driver stages `php/composer.json` +
+  `php/src/` as `<temp>/framework` (not `php/vendor/`: copying that off the bind mount
+  took 3.5 min) and runs `composer update --optimize-autoloader --no-dev` in
+  `<temp>/app` once for all child runs (`K4P_BENCH_APP`). Re-recorded on PHP 8.4 and
+  8.5 (same laptop, AC power) after the review changes: DESIGN.md §5.7. Above the
+  `empty` floor (which drifts ~5–10% between sessions), `kernel` costs ~5 µs more with
+  OPcache than on the stand-in and ~200 µs more without: one more class
+  (`ExceptionPolicy`) and twice the source. Ratios: OPcache still ~25×, preload −30%.
+- **For S9:** inside the SAPI, the framework has only run via the benchmark: `Kernel` +
+  `Router` + `NativeFunctionsBridge` → `NoContent`, 8.4 and 8.5. The other results and
+  the exception policy are covered by unit tests only. The entrypoint needs
+  `vendor/autoload.php` (composer install in the image).
 
 **Notes from other steps:**
 - From S4: **switch the benchmark to the real framework.** S4's benchmark
@@ -833,6 +874,11 @@ covering DESIGN.md §9's E2E scenarios.
   changes). As a non-root user, don't set `opcache.preload_user` (it is only needed,
   as `root`, when running as root). Preload output goes to the process stdout, not the
   log.
+- From S5: inside the SAPI the framework (`php/`) has only run the S4 benchmark's
+  `NoContent` path; every other result and the exception policy are unit-tested with
+  `FakeNativeBridge` only. The example app should use `(new Kernel())->run()` with the default
+  `NativeFunctionsBridge` and exercise every result kind; include one invalid `Content`
+  (e.g. empty topic), since PHP doesn't validate results — C does (§5.2).
 
 ---
 
@@ -868,6 +914,7 @@ building it).
   only enables OPcache for a fixed list of SAPI names; PHP 8.5 has full OPcache.
   Recommend the 8.5 image when performance matters. DESIGN.md §5.1.
 - From S4: the performance page comes from DESIGN.md §5.7 — quote the ratios
-  (OPcache ≈ 25× for a typical entrypoint, preload ≈ −25%), not the absolute numbers
+  (OPcache ≈ 25× for a typical entrypoint, preload ≈ −30% — S5 re-recorded it on the
+  real framework), not the absolute numbers
   of a dev laptop; ideally re-run `cargo bench -p k4p-php-sys --bench request_cost` on
   a Linux host. Document the default INI (§5.1.2) and the preload/`preload_user` rules.

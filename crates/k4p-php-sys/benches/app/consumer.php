@@ -3,7 +3,7 @@
 require __DIR__ . '/vendor/autoload.php';
 
 use Bench\App\OrderPlacedHandler;
-use Bench\Framework\Kernel;
-use Bench\Framework\Router;
+use Kafka4php\Kernel;
+use Kafka4php\Router;
 
-Kernel::run((new Router())->on('orders', new OrderPlacedHandler()));
+(new Kernel())->run((new Router())->on('orders', new OrderPlacedHandler()));

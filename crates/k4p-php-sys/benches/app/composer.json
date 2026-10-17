@@ -1,11 +1,26 @@
 {
     "name": "kafka4php/bench-app",
-    "description": "Benchmark fixture: a stand-in for kafka4php/framework (DESIGN.md §5.4) and a trivial handler",
+    "description": "Benchmark fixture: a typical app on kafka4php/framework (DESIGN.md §5.4) with a trivial handler; benches/request_cost.rs stages php/ as ../framework",
     "type": "project",
     "license": "proprietary",
+    "repositories": {
+        "framework": {
+            "type": "path",
+            "url": "../framework",
+            "options": {
+                "symlink": false,
+                "versions": {
+                    "kafka4php/framework": "dev-main"
+                }
+            }
+        },
+        "packagist.org": false
+    },
+    "require": {
+        "kafka4php/framework": "dev-main"
+    },
     "autoload": {
         "psr-4": {
-            "Bench\\Framework\\": "src/Framework/",
             "Bench\\App\\": "src/App/"
         }
     }
